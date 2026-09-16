@@ -118,7 +118,23 @@ NapCat 靠**实时事件推送**，历史消息拉取能力有限且不稳定。
 
 ## 配置说明
 
-全部配置项见 `.env.example`（每项都有中文注释）。最关键的几项：
+全部配置项见 `.env.example`（每项都有中文注释）。
+
+**配置按进程划分，不按功能划分。** 判据是：这个值改变时，需要重启哪个进程？
+凡是只跟 QQ 接入有关的（`ONEBOT_*`、合并转发展开深度），一律在
+[`xcollector-bot`](../xcollector-bot/) 那边配 —— 后端已经不认识 OneBot 协议了，
+在这里放一个自己永远不读的配置项，只会让人改了之后困惑为什么没生效。
+
+两个跨进程的密钥，**在两边刻意用同一个名字**：
+
+| 密钥 | 谁递出 | 谁校验 | 在本仓库的配置项 |
+|---|---|---|---|
+| bot → 后端 | bot | 后端 | `INGEST_API_TOKEN` |
+| 后端 → bot | 后端 | bot | `BOT_API_TOKEN` |
+
+所以同一个值在 `backend/.env` 和 `bot/.env` 里都叫同一个名字，不需要猜对应关系。
+
+最关键的几项：
 
 | 配置 | 说明 |
 |---|---|
@@ -234,6 +250,9 @@ python -m tests.check_corrections
 
 # 每条消息恰好一行日志（6 种结局各一条）
 python -m tests.check_message_log
+
+# 配置边界（字段都有引用 / .env.example 无错键 / 两边不越界 / 共享密钥同名）
+python -m tests.check_config
 
 # 注入演示数据跑通全链路
 python -m app.tools.seed_demo --reset --extractor rule

@@ -103,7 +103,9 @@ class Settings(BaseSettings):
     # 消息日志里原文预览的最大长度
     log_preview_chars: int = 60
 
-    forward_max_depth: int = 3
+    # 注：合并转发展开的深度上限（FORWARD_MAX_DEPTH）是 **bot 侧**的配置。
+    # 展开发生在 bot 里（后端收到的已经是纯文本），所以这里不再声明它 ——
+    # 否则会出现一个后端永远不读、改了不起任何作用的配置项。
 
     # ---------------- 派生属性 ----------------
 
