@@ -1,6 +1,6 @@
 """日志初始化。
 
-抽出来共用，是因为 `python -m app.tools.seed_demo` 这类入口脚本如果没配置 logging，
+抽出来共用，是因为自检脚本（`python -m tests.xxx`）如果没配置 logging，
 INFO 级别会走 Python 的 lastResort handler —— 只把 WARNING 以上打到 stderr，
 结果就是"明明加了日志却什么都看不到"。
 """
@@ -27,4 +27,4 @@ def setup_logging(level: str | None = None) -> None:
     )
     # 这两个库的 INFO 噪音很大，压到 WARNING
     logging.getLogger("httpx").setLevel(logging.WARNING)
-    logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+    logging.getLogger("aiosqlite").setLevel(logging.WARNING)

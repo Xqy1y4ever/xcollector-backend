@@ -1,82 +1,202 @@
-"""把库里的行变成 API 视图。
+"""把库里的行变成 API 视图（读投影）。
 
-核心逻辑：**correction 表覆盖 notification 表**。
-这样重跑抽取（改 prompt、换模型）永远不会覆盖人工修正过的字段。
+核心逻辑只有一条：**correction 表覆盖 notification 表**，再由 `due_at` 推导
+`status`。这样重跑（改 prompt、换模型）永远不会覆盖人工修正过的字段。
+
+契约把这件事特许留在后端：前端直接消费后端，必须拿到"人工修正已生效、
+status 已推导"的视图。这是「查」，不是业务判断。
+
+为什么整段投影是 SQL：列表接口要一次拿回 N 行，如果在 Python 里逐行再查
+corrections / read_state 就是 N+1。这里的做法是**一次 JOIN + 相关子查询**
+（子查询走 `correction(notification_id, field, ts)` 索引），一次查询出全部行；
+`status` 过滤、`q` 搜索、`since` 增量也都在同一层 SQL 里做，
+于是 `limit` 的语义才是对的（先筛再截断，而不是截断了再在内存里筛）。
 """
 
 from __future__ import annotations
 
-import json
+from typing import Any, Sequence
 
-from .db import corrections_for, read_map
-from .utils import now_ms
+from .db import count_of, fetch_all, fetch_one
+from .utils import json_loads, now_ms
 
-
-def _correction_to_value(field: str, raw_value):
-    if raw_value is None:
-        return None
-    if field == "due_at":
-        try:
-            return int(float(raw_value))
-        except (TypeError, ValueError):
-            return None
-    return raw_value
+# 只追加的人工修正层里，允许出现的字段（契约 §2）
+CORRECTABLE_FIELDS = ("title", "summary", "location", "due_at", "due_text", "status")
 
 
-def _effective(row: dict, corr: dict) -> dict:
-    due_at = row.get("due_at")
-    due_text = row.get("due_text")
-    title = row.get("title")
-    summary = row.get("summary")
-    location = row.get("location")
+def _latest_id(field: str) -> str:
+    """该通知该字段是否存在人工修正（NULL 既可能是"没改过"也可能是"改成 NULL"，
+    所以要单独取一次 id 来区分）。"""
+    return (
+        "(SELECT c.id FROM correction c WHERE c.notification_id = n.id"
+        f" AND c.field = '{field}' ORDER BY c.ts DESC, c.id DESC LIMIT 1)"
+    )
 
-    if "due_at" in corr:
-        due_at = _correction_to_value("due_at", corr["due_at"])
-    if "due_text" in corr:
-        due_text = corr["due_text"]
-    if "title" in corr and corr["title"]:
-        title = corr["title"]
-    if "summary" in corr:
-        summary = corr["summary"]
-    # location 允许被人工清空（空字符串即"原文没写地点"），所以不能像 title 那样判真假
-    if "location" in corr:
-        location = corr["location"] or None
 
-    if "status" in corr and corr["status"]:
-        status = corr["status"]
-    elif due_at is not None and due_at < now_ms():
-        status = "expired"
-    else:
-        status = "active"
+def _latest_value(field: str) -> str:
+    return (
+        "(SELECT c.value FROM correction c WHERE c.notification_id = n.id"
+        f" AND c.field = '{field}' ORDER BY c.ts DESC, c.id DESC LIMIT 1)"
+    )
 
-    try:
-        candidates = json.loads(row.get("candidates") or "[]")
-    except json.JSONDecodeError:
-        candidates = []
-    try:
-        attachments = json.loads(row.get("attachments") or "[]")
-    except json.JSONDecodeError:
-        attachments = []
 
+def _due_at_sql() -> str:
+    return (
+        f"CASE WHEN {_latest_id('due_at')} IS NOT NULL"
+        f" THEN CAST({_latest_value('due_at')} AS INTEGER) ELSE n.due_at END"
+    )
+
+
+def _status_sql(now: int) -> str:
+    """人工 status 优先；否则 due_at 已过 → expired，其余 active。"""
+    due = _due_at_sql()
+    return (
+        f"CASE WHEN {_latest_id('status')} IS NOT NULL"
+        f" AND COALESCE({_latest_value('status')}, '') <> ''"
+        f" THEN {_latest_value('status')}"
+        f" WHEN {due} IS NOT NULL AND {due} < {int(now)} THEN 'expired'"
+        " ELSE 'active' END"
+    )
+
+
+def _projection_sql(now: int | None = None) -> str:
+    moment = now_ms() if now is None else now
+    return f"""
+WITH proj AS (
+  SELECT
+    n.id                                          AS id,
+    n.group_id                                    AS group_id,
+    n.group_name                                  AS group_name,
+    n.sender_id                                   AS sender_id,
+    n.sender_name                                 AS sender_name,
+    CASE WHEN {_latest_id('title')} IS NOT NULL
+              AND COALESCE({_latest_value('title')}, '') <> ''
+         THEN {_latest_value('title')} ELSE n.title END            AS title,
+    CASE WHEN {_latest_id('summary')} IS NOT NULL
+         THEN {_latest_value('summary')} ELSE n.summary END        AS summary,
+    CASE WHEN {_latest_id('location')} IS NOT NULL
+         THEN NULLIF({_latest_value('location')}, '') ELSE n.location END AS location,
+    {_due_at_sql()}                                                AS due_at,
+    CASE WHEN {_latest_id('due_text')} IS NOT NULL
+         THEN {_latest_value('due_text')} ELSE n.due_text END      AS due_text,
+    n.due_confidence                              AS due_confidence,
+    n.conflict                                    AS conflict,
+    n.candidates                                  AS candidates,
+    n.evidence                                    AS evidence,
+    {_status_sql(moment)}                         AS status,
+    (SELECT COUNT(*) FROM correction c WHERE c.notification_id = n.id)
+                                                  AS correction_count,
+    (SELECT rs.read_at FROM read_state rs WHERE rs.notification_id = n.id)
+                                                  AS read_at,
+    n.extractor                                   AS extractor,
+    n.model                                       AS model,
+    n.prompt_ver                                  AS prompt_ver,
+    n.source_ts                                   AS source_ts,
+    n.created_at                                  AS created_at,
+    n.updated_at                                  AS updated_at,
+    r.attachments                                 AS raw_attachments
+  FROM notification n
+  LEFT JOIN raw_message r ON r.id = n.raw_message_id
+)
+"""
+
+
+_LIKE_ESCAPE = "\\"
+
+
+def like_pattern(needle: str) -> str:
+    escaped = (
+        needle.replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", _LIKE_ESCAPE + "%")
+        .replace("_", _LIKE_ESCAPE + "_")
+    )
+    return f"%{escaped}%"
+
+
+def _notification_where(
+    *,
+    notif_id: str | None = None,
+    since: int | None = None,
+    status: str | None = None,
+    q: str | None = None,
+) -> tuple[str, list[Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if notif_id is not None:
+        clauses.append("id = ?")
+        params.append(notif_id)
+    if since is not None:
+        clauses.append("updated_at > ?")
+        params.append(int(since))
+    if status and status != "all":
+        clauses.append("status = ?")
+        params.append(status)
+    if q:
+        pattern = like_pattern(q.strip())
+        clauses.append(
+            f"(title LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
+            f" OR summary LIKE ? ESCAPE '{_LIKE_ESCAPE}'"
+            f" OR evidence LIKE ? ESCAPE '{_LIKE_ESCAPE}')"
+        )
+        params.extend([pattern, pattern, pattern])
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    return where, params
+
+
+async def list_notification_views(
+    *,
+    since: int | None = None,
+    status: str = "all",
+    q: str | None = None,
+    limit: int = 500,
+) -> list[dict]:
+    where, params = _notification_where(since=since, status=status, q=q)
+    sql = (
+        _projection_sql()
+        + f"SELECT * FROM proj{where}"
+        + " ORDER BY due_at IS NULL, due_at ASC, source_ts DESC LIMIT ?"
+    )
+    rows = await fetch_all(sql, (*params, int(limit)))
+    return [to_view(row) for row in rows]
+
+
+async def count_notification_views(
+    *,
+    since: int | None = None,
+    status: str = "all",
+    q: str | None = None,
+) -> int:
+    where, params = _notification_where(since=since, status=status, q=q)
+    return await count_of(_projection_sql() + f"SELECT COUNT(*) AS c FROM proj{where}", params)
+
+
+async def get_notification_view(notif_id: str) -> dict | None:
+    where, params = _notification_where(notif_id=notif_id)
+    row = await fetch_one(_projection_sql() + f"SELECT * FROM proj{where}", params)
+    return to_view(row) if row else None
+
+
+def to_view(row: dict) -> dict:
+    """读投影对象的字段顺序与契约 §2 的表格一一对应。"""
     return {
         "id": row["id"],
         "group_id": row.get("group_id"),
         "group_name": row.get("group_name"),
         "sender_id": row.get("sender_id"),
         "sender_name": row.get("sender_name"),
-        "title": title,
-        "summary": summary,
-        "location": location,
-        "due_at": due_at,
-        "due_text": due_text,
-        "due_confidence": row.get("due_confidence") or 0.0,
+        "title": row.get("title"),
+        "summary": row.get("summary"),
+        "location": row.get("location"),
+        "due_at": row.get("due_at"),
+        "due_text": row.get("due_text"),
+        "due_confidence": float(row.get("due_confidence") or 0.0),
         "conflict": bool(row.get("conflict")),
-        "candidates": candidates,
+        "candidates": json_loads(row.get("candidates"), []),
         "evidence": row.get("evidence") or "",
-        "status": status,
-        "manually_edited": bool(corr),
-        "read": bool(row.get("_read")),
-        "attachments": attachments,
+        "status": row.get("status"),
+        "manually_edited": bool(row.get("correction_count")),
+        "read": row.get("read_at") is not None,
+        "attachments": json_loads(row.get("raw_attachments"), []),
         "extractor": row.get("extractor"),
         "model": row.get("model"),
         "prompt_ver": row.get("prompt_ver"),
@@ -86,19 +206,56 @@ def _effective(row: dict, corr: dict) -> dict:
     }
 
 
-async def build_views(rows: list[dict]) -> list[dict]:
-    if not rows:
-        return []
-    corr_map = await corrections_for([r["id"] for r in rows])
-    reads = await read_map()
-    out = []
-    for row in rows:
-        r = dict(row)
-        r["_read"] = r["id"] in reads
-        out.append(_effective(r, corr_map.get(r["id"], {})))
-    return out
+# 读投影对象的全部字段名（自检脚本用它断言"字段一个都不少"）
+VIEW_FIELDS = (
+    "id",
+    "group_id",
+    "group_name",
+    "sender_id",
+    "sender_name",
+    "title",
+    "summary",
+    "location",
+    "due_at",
+    "due_text",
+    "due_confidence",
+    "conflict",
+    "candidates",
+    "evidence",
+    "status",
+    "manually_edited",
+    "read",
+    "attachments",
+    "extractor",
+    "model",
+    "prompt_ver",
+    "source_ts",
+    "created_at",
+    "updated_at",
+)
 
 
-async def build_view(row: dict) -> dict:
-    views = await build_views([row])
-    return views[0]
+def raw_view(row: dict | None) -> dict | None:
+    """raw_message 行的对外形状（含 content / attachments / raw / state）。"""
+    if row is None:
+        return None
+    return {
+        "id": row.get("id"),
+        "message_id": row.get("message_id"),
+        "group_id": row.get("group_id"),
+        "group_name": row.get("group_name"),
+        "sender_id": row.get("sender_id"),
+        "sender_name": row.get("sender_name"),
+        "ts": row.get("ts"),
+        "content": row.get("content") or "",
+        "attachments": json_loads(row.get("attachments"), []),
+        "raw": json_loads(row.get("raw"), {}),
+        "ingested_at": row.get("ingested_at"),
+        "state": row.get("state"),
+        "state_reason": row.get("state_reason"),
+        "state_at": row.get("state_at"),
+    }
+
+
+def raw_views(rows: Sequence[dict]) -> list[dict]:
+    return [raw_view(row) for row in rows]

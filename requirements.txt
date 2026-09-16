@@ -1,13 +1,16 @@
 # Xcollector backend —— 核心依赖（Python 3.12+）
-# 只装这些就能用 EXTRACTOR=rule 跑通全链路（入库 → 抽取 → API → 前端 → digest）。
-# 需要真正调用大模型时，再装 requirements-llm.txt。
+#
+# 本服务是纯数据层：SQLite + FastAPI，没有后台任务、没有外部 API 客户端。
+# （QQ 连接、抽取、digest 全在 xcollector-bot，它有自己的 requirements.txt。）
 fastapi>=0.115.0
 uvicorn[standard]>=0.30.0
-websockets>=12.0,<15.0
-httpx>=0.27.0
 aiosqlite>=0.20.0
 pydantic>=2.7.0
 pydantic-settings>=2.3.0
 python-dotenv>=1.0.0
-# Windows 没有系统 tzdata，ZoneInfo("Asia/Shanghai") 会失败
-tzdata>=2024.1
+
+# 自检脚本用（tests/check_api.py 打真实 HTTP 请求）
+httpx>=0.27.0
+
+# 注：上传接口的 multipart/form-data 由 app/attachments.py 自己解析，
+# 因此**不需要** python-multipart；少一个"不装就传不了附件"的依赖。

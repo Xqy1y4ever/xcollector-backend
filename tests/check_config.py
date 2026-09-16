@@ -6,11 +6,12 @@
 
   1. 每个进程只声明自己真正用得到的配置 —— 没有「定义了但没人读」的字段
   2. .env.example 里的每一项都能对应到一个 Settings 字段（没有写错的键名）
-  3. 后端不出现只属于 bot 的配置（ONEBOT_*、合并转发展开深度），反之亦然
+  3. 两个仓库不互相夹带：backend 不出现只属于 bot 的配置（QQ 连接、白名单、
+     抽取、digest），bot 不出现只属于 backend 的存储/HTTP 配置
   4. 跨进程共享的密钥在两边**同名**
 
 第 4 条最容易出错，也最烦人：同一个值如果一边叫 A 一边叫 B，
-配置的人得靠猜才知道它们必须一致。
+配置的人得靠猜才知道它们必须一致。整套系统现在只有**一个**共享密钥：`API_TOKEN`。
 
 bot 仓库不在旁边时，第 3、4 条会跳过（只校验本仓库）。
 """
@@ -30,15 +31,16 @@ BOT_ONLY = {
     "ONEBOT_LISTEN_HOST", "ONEBOT_LISTEN_PORT", "ONEBOT_LISTEN_PATH",
     "FORWARD_MAX_DEPTH", "COMMAND_PREFIX", "COMMAND_WHITELIST",
     "PENDING_TTL_SECONDS", "BOT_LISTEN_HOST", "BOT_LISTEN_PORT",
+    "BACKEND_BASE_URL", "BACKEND_TIMEOUT", "BACKEND_MAX_RETRIES",
 }
-# 只属于后端的配置：bot 不该出现
+# 只属于后端的配置：bot 不该出现。
+# 这里刻意**不含** MEDIA_MAX_BYTES：bot 下载附件要限大小、后端落盘也要限大小，
+# 两边各自有上限是合理的，"同名"在这里不代表必须相等。
 BACKEND_ONLY = {
-    "GROUP_WHITELIST", "SENDER_WHITELIST", "SENDER_WHITELIST_MODE",
-    "EXTRACTOR", "LLM_PRIMARY_MODEL", "LLM_SECONDARY_MODEL",
-    "DB_PATH", "ATTACHMENT_DIR", "DIGEST_TARGET_QQ", "DIGEST_TIME",
+    "DB_PATH", "ATTACHMENT_DIR", "SERVER_HOST", "SERVER_PORT", "CORS_ORIGINS",
 }
-# 两边都必须同名（同一个共享密钥）
-SHARED_MUST_MATCH = {"INGEST_API_TOKEN", "BOT_API_TOKEN"}
+# 两边都必须同名（唯一的共享密钥：bot 调后端时的 Bearer 令牌）
+SHARED_MUST_MATCH = {"API_TOKEN"}
 
 KEY_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=", re.M)
 DECL_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*:\s*[^=\n]+=", re.M)
