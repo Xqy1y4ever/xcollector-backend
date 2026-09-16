@@ -237,6 +237,24 @@ tests/                 自检脚本
 
 ## 故障排查
 
+**启动或首次抽取时卡住几十秒，并刷 `LiteLLM: model cost map fetch attempt 1/3 failed`**
+litellm 在**导入时**会去 `raw.githubusercontent.com` 拉模型价格表，网络不通时会阻塞导入、
+再起后台线程重试 3 次。我们只用 `usage.total_tokens`，不需要这张表，
+`app/__init__.py` 已默认设 `LITELLM_LOCAL_MODEL_COST_MAP=True` 强制用包里自带的副本。
+
+本机实测：**导入耗时 87.2s → 2.8s**。
+
+如果你是在自己的代码里直接 `import litellm`（而不是通过 `app` 包），
+需要在导入**之前**自行设置这个环境变量：
+
+```bash
+set LITELLM_LOCAL_MODEL_COST_MAP=True      # Windows
+export LITELLM_LOCAL_MODEL_COST_MAP=True   # Linux/macOS
+```
+
+注意 litellm 是**惰性导入**的（第一次抽取时才加载），所以这个延迟表现为
+"第一条消息处理起来像卡死了"，而不是启动时慢。
+
 **`aiosqlite` 相关：脚本报错后进程不退出**
 aiosqlite 的工作线程不是 daemon。自检脚本必须保证 `await close_db()` 被执行
 （`tests/check_corrections.py` 用 `try/finally` 示范了正确写法）。

@@ -63,6 +63,28 @@ class LLMNotification(BaseModel):
     evidence: str = ""
 
 
+_LITELLM_CONFIGURED = False
+
+
+def _configure_litellm() -> None:
+    """导入 litellm 之后再关掉剩余的联网 / 噪音开关。
+
+    价格表那一项必须在**导入前**用环境变量关（见 app/__init__.py），
+    这里处理的是导入之后才可写的模块属性。
+    """
+    global _LITELLM_CONFIGURED
+    if _LITELLM_CONFIGURED:
+        return
+    try:
+        import litellm
+
+        litellm.telemetry = False
+        litellm.suppress_debug_info = True
+    except Exception:  # 只是降噪，失败无所谓
+        pass
+    _LITELLM_CONFIGURED = True
+
+
 def _strip_code_fence(text: str) -> str:
     t = text.strip()
     if t.startswith("```"):
@@ -113,6 +135,8 @@ async def _call_model(
 ) -> tuple[LLMNotification, int]:
     """调用一次模型，返回 (解析结果, 消耗 token 数)。失败抛异常。"""
     from litellm import acompletion  # 延迟导入：litellm 加载较慢，且是可选的
+
+    _configure_litellm()
 
     settings = get_settings()
     local_ts = to_local(raw["ts"])
