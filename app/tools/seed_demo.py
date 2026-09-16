@@ -17,6 +17,7 @@ import time
 from ..config import get_settings
 from ..db import close_db, execute, init_db
 from ..pipeline.ingest import handle_event, close_http
+from ..utils import local_day
 
 # (文本, 发送者QQ, 发送者昵称, 多少分钟前, 是否@全体成员)
 SAMPLES: list[tuple[str, str, str, int, bool]] = [
@@ -55,7 +56,12 @@ async def main() -> int:
             "DELETE FROM notification WHERE raw_message_id IN (SELECT id FROM raw_message WHERE message_id LIKE 'seed-%')"
         )
         n = await execute("DELETE FROM raw_message WHERE message_id LIKE 'seed-%'")
-        print(f"已清除 {n} 条旧的演示原始消息")
+        # 当日统计必须一起清掉，否则 digest 里的"收到 N 条"会和实际演示数据对不上。
+        # 盲区数字一旦不可信，整个系统就没有可信的部分了。
+        today = local_day()
+        await execute("DELETE FROM digest_log WHERE day=?", (today,))
+        await execute("DELETE FROM pipeline_stat WHERE day=?", (today,))
+        print(f"已清除 {n} 条旧的演示原始消息，并重置当日统计")
 
     groups = list(settings.group_whitelist_map.keys())
     group_id = groups[0] if groups else "123456789"
