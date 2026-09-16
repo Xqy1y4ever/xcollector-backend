@@ -6,6 +6,36 @@
 
 ---
 
+## 实现现状与本文档的差异
+
+本文档是最初的设计稿。实现时有一处**结构性调整**，读 §3「总体架构」时请注意：
+接入层（`connectors`）已经从后端**拆成独立仓库** `xcollector-bot`。
+
+```
+QQ/NapCat ──OneBot WS──▶ xcollector-bot ──HTTP POST /api/ingest/messages──▶ xcollector-backend
+                              ▲                                                    │
+                              └──────── HTTP POST /api/send/private ◀───────────────┘
+```
+
+- bot 负责：OneBot 连接、消息段解析、**合并转发展开**、附件 URL 透传、私聊指令
+- 后端负责：归一化消息 → 原始层 → 白名单 → 抽取 → 存储 → digest → HTTP API
+- 后端**不认识 OneBot 协议**，因此换掉 NapCat 或换掉整个 QQ 实现都只影响 bot
+
+另外这些与本文档不同，实现时按「更简单/更安全」的原则做了取舍：
+
+| 本文档 | 实现 |
+|---|---|
+| `screen` 规则初筛打分 | 简化为「群 × 发送者」双重白名单；未引入打分表 |
+| `merge` 实体归并 + 任务状态机 | **未实现**。一条原始消息对应一条通知；同一条重发会生成多条 |
+| `note` 知识库 | **未实现**（本版本只做官方通知） |
+| `task` / `task_event` 表 | 未引入；状态用 `notification` 上的 `status` 表达，由 `correction` 覆盖 |
+| `drop_log` 表 | 未引入；改由 `raw_message.state` + 每条消息一行日志承担 |
+| 通知的 `location` 字段 | **新增**（本文档未提），规则 + LLM 双路抽取，可人工修正 |
+
+路线图 v1 里的「任务状态机 + 归并」「评测集」「知识库」仍未做，见各仓库 README 的「已知边界」。
+
+---
+
 ## 1. 背景与目标
 
 ### 1.1 问题

@@ -8,9 +8,10 @@ from __future__ import annotations
 import json
 import logging
 
-from fastapi import APIRouter, HTTPException, Query
+from fastapi import APIRouter, Header, HTTPException, Query
 from pydantic import BaseModel
 
+from ..bot_client import get_bot
 from ..config import get_settings
 from ..db import (
     add_correction,
@@ -22,16 +23,19 @@ from ..db import (
     set_read,
 )
 from ..materialize import build_view, build_views
-from ..onebot import get_hub
 from ..pipeline.digest import build_digest, send_digest
+from ..pipeline.ingest import handle_messages
+from ..pipeline.manual import create_manual_task
 from ..utils import local_day, now_ms
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api")
 
 UNPARSED_WINDOW_DAYS = 7
-CORRECTABLE_FIELDS = {"title", "summary", "due_at", "due_text", "status"}
-VALID_STATUS = {"active", "archived"}
+CORRECTABLE_FIELDS = {"title", "summary", "location", "due_at", "due_text", "status"}
+# done 与 archived 的区别：done = 做完了，archived = 不是通知/误报。
+# 前端把 done 单独成组弱化显示，archived 直接从主列表消失。
+VALID_STATUS = {"active", "archived", "done"}
 
 
 # --------------------------------------------------------------------------
@@ -214,12 +218,12 @@ async def mark_read(notif_id: str, body: ReadBody):
 @router.get("/health")
 async def health():
     settings = get_settings()
-    hub = get_hub()
+    bot_status = await get_bot().status()
     now = now_ms()
 
     states = {str(s["group_id"]): s for s in await list_group_states()}
     groups: list[dict] = []
-    for gid, name in settings.group_whitelist_map.items():
+    for gid, name in settings.group_display_names.items():
         s = states.pop(gid, None)
         if s is None:
             groups.append(
@@ -231,7 +235,7 @@ async def health():
                     "last_msg_at": None,
                     "silent_hours": None,
                     "msg_count_today": 0,
-                    "note": "尚未收到该群任何消息：群号可能配错，或 NapCat 未订阅该群",
+                    "note": "尚未收到该群任何消息：群号可能配错，或 bot 未订阅该群",
                 }
             )
             continue
@@ -264,7 +268,9 @@ async def health():
     stat = await get_stat()
     return {
         "server_time": now,
-        "onebot": hub.status(),
+        # 键名保留 onebot 以兼容前端；内容是 bot 转发过来的连接状态
+        "onebot": bot_status,
+        "bot": bot_status,
         "groups": groups,
         "pipeline": {
             "today_ingested": int(stat.get("ingested") or 0),
@@ -327,7 +333,69 @@ async def config_meta():
         "digest_enabled": settings.digest_enabled,
         "digest_target_qq": settings.digest_target_qq or None,
         "extractor": settings.extractor,
-        "onebot_mode": settings.onebot_mode,
+        "bot_base_url": settings.bot_base_url,
+        "bot_token_configured": bool(settings.bot_api_token),
+        "ingest_token_configured": bool(settings.ingest_api_token),
         "low_confidence_threshold": settings.low_confidence_threshold,
         "gap_alert_hours": settings.gap_alert_hours,
     }
+
+
+# --------------------------------------------------------------------------
+# 接入：bot 推消息进来
+# --------------------------------------------------------------------------
+
+
+def _check_ingest_token(authorization: str | None) -> None:
+    settings = get_settings()
+    expected = settings.ingest_api_token
+    if not expected:
+        return  # 未配置令牌 = 不校验（仅本地开发）
+    if (authorization or "") != f"Bearer {expected}":
+        raise HTTPException(status_code=401, detail="ingest 令牌无效")
+
+
+class IngestBody(BaseModel):
+    messages: list[dict] = []
+
+
+@router.post("/ingest/messages")
+async def ingest_messages(body: IngestBody, authorization: str | None = Header(default=None)):
+    """bot 把归一化后的 QQ 消息推到这里。
+
+    注意：这一层是**推送入口**，不是查询接口。它对每条消息做同样的事：
+    落原始层 → 群/发送者白名单 → 抽取。任何消息都不会被静默丢弃，
+    白名单外/重复的消息也会在日志里留下记录。
+    """
+    _check_ingest_token(authorization)
+    if not body.messages:
+        return {"ok": True, "received": 0}
+    return await handle_messages(body.messages)
+
+
+# --------------------------------------------------------------------------
+# 手动建任务（QQ 里用 /add 指令）
+# --------------------------------------------------------------------------
+
+
+class ManualTaskBody(BaseModel):
+    text: str
+    sender_id: str = ""
+    sender_name: str = ""
+    # auto_commit: 解析有把握就直接建；没把握则只返回 preview 让 bot 回问
+    auto_commit: bool = True
+    # force_commit: 用户在 bot 里确认过了，无论有没有把握都建
+    force_commit: bool = False
+
+
+@router.post("/tasks/manual")
+async def create_manual(body: ManualTaskBody):
+    if not body.text.strip():
+        raise HTTPException(status_code=400, detail="text 不能为空")
+    return await create_manual_task(
+        text=body.text,
+        sender_id=body.sender_id,
+        sender_name=body.sender_name,
+        auto_commit=body.auto_commit,
+        force_commit=body.force_commit,
+    )

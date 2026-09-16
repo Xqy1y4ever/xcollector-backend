@@ -105,31 +105,28 @@ def log_message(
     return line
 
 
-def event_meta(event: Mapping[str, Any], *, content: str = "", parsed=None) -> dict[str, Any]:
-    """把 OneBot 事件整理成日志需要的字段。
+def message_meta(message: Mapping[str, Any], *, content: str = "") -> dict[str, Any]:
+    """把归一化消息整理成日志需要的字段。
 
     用于消息还没入库、或者压根不会入库的分支（群不在白名单）。
+    归一化消息由 bot 提供，后端不认识 OneBot 协议。
     """
-    sender = event.get("sender") or {}
-    sender_id = event.get("user_id")
-    ts = event.get("time")
+    message_id = message.get("message_id")
+    ts = message.get("ts")
+    attachments = message.get("attachments") or []
     meta: dict[str, Any] = {
-        "group_id": event.get("group_id"),
-        "group_name": None,
-        "sender_id": sender_id,
-        "sender_name": sender.get("card") or sender.get("nickname") or sender_id,
-        "message_id": event.get("message_id"),
-        "ts": int(ts) * 1000 if ts else None,
-        "content": content,
+        "group_id": message.get("group_id"),
+        "group_name": message.get("group_name"),
+        "sender_id": message.get("sender_id"),
+        "sender_name": message.get("sender_name") or message.get("sender_id"),
+        "message_id": message_id,
+        "ts": int(ts) if ts else None,
+        "content": content or (message.get("text") or ""),
     }
-    if parsed is not None:
-        attachments = getattr(parsed, "attachments", None) or []
-        if attachments:
-            meta["附件"] = len(attachments)
-        if getattr(parsed, "forwards", None):
-            meta["转发"] = len(parsed.forwards)
-        if getattr(parsed, "at_all", False):
-            meta["@全体成员"] = "是"
+    if attachments:
+        meta["附件"] = len(attachments)
+    if message.get("at_all"):
+        meta["@全体成员"] = "是"
     return meta
 
 

@@ -18,7 +18,7 @@ from typing import Callable
 
 from app.config import get_settings
 from app.db import close_db, execute, init_db
-from app.pipeline.ingest import close_http, handle_event
+from app.pipeline.ingest import close_http, handle_message
 
 MSG_ID = re.compile(r"msg_id=(\S+)")
 OUTCOME = re.compile(r"结果=(\S+)")
@@ -37,19 +37,22 @@ class Capture(logging.Handler):
 
 
 def _event(message_id: str, group_id: str, text: str, sender_id: str, sender_name: str) -> dict:
+    """构造一条 bot 会推过来的**归一化消息**（不是 OneBot 原始事件）。"""
     now = int(time.time())
     return {
-        "post_type": "message",
-        "message_type": "group",
-        "sub_type": "normal",
-        "self_id": "999999",
-        "group_id": group_id,
-        "user_id": sender_id,
+        "source": "qq",
         "message_id": message_id,
-        "time": now - 60,
-        "raw_message": text,
-        "sender": {"user_id": sender_id, "nickname": sender_name, "card": sender_name},
-        "message": [{"type": "text", "data": {"text": text}}],
+        "group_id": group_id,
+        "group_name": None,
+        "sender_id": sender_id,
+        "sender_name": sender_name,
+        "ts": (now - 60) * 1000,
+        "text": text,
+        "at_all": False,
+        "mentions": [],
+        "reply_to": None,
+        "attachments": [],
+        "raw": {},
     }
 
 
@@ -144,7 +147,7 @@ async def _run() -> int:
         if before:
             before()
         cursor = len(handler.lines)
-        await handle_event(event)
+        await handle_message(event)
         produced = handler.lines[cursor:]
         if after:
             after()

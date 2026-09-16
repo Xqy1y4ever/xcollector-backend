@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from typing import Any, Iterable, Sequence
 
@@ -19,6 +20,8 @@ import aiosqlite
 
 from .config import get_settings
 from .utils import local_day, new_id, now_ms
+
+logger = logging.getLogger(__name__)
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -60,6 +63,7 @@ CREATE TABLE IF NOT EXISTS notification (
   source_ts      INTEGER NOT NULL,
   title          TEXT NOT NULL,
   summary        TEXT,
+  location       TEXT,                     -- 通知里的地点，如「教三201」；NULL = 原文没提
   due_at         INTEGER,                  -- NULL = 没解析出确定时间（合法状态）
   due_text       TEXT,                     -- 原文时间表达，如「下周三前」
   due_confidence REAL NOT NULL DEFAULT 0,
@@ -81,7 +85,7 @@ CREATE INDEX IF NOT EXISTS ix_notif_group   ON notification(group_id, source_ts 
 CREATE TABLE IF NOT EXISTS correction (
   id              TEXT PRIMARY KEY,
   notification_id TEXT NOT NULL,
-  field           TEXT NOT NULL,           -- title|summary|due_at|due_text|status
+  field           TEXT NOT NULL,           -- title|summary|location|due_at|due_text|status
   value           TEXT,                    -- 统一存字符串，读取时按字段类型还原
   user_id         TEXT,
   ts              INTEGER NOT NULL
@@ -144,6 +148,24 @@ CREATE INDEX IF NOT EXISTS ix_digest_day ON digest_log(day, kind);
 _conn: aiosqlite.Connection | None = None
 _write_lock = asyncio.Lock()
 
+# 增量迁移：(表, 列, 列定义)
+# SQLite 没有 ADD COLUMN IF NOT EXISTS，只能先读表结构再决定加不加。
+# 加列不影响已有数据，历史行的新列是 NULL —— 例如 location 加进来之后，
+# 老通知的地点就是空的，需要人工补或重跑抽取。
+_MIGRATIONS: list[tuple[str, str, str]] = [
+    ("notification", "location", "TEXT"),
+]
+
+
+async def _migrate() -> None:
+    for table, column, decl in _MIGRATIONS:
+        async with db().execute(f"PRAGMA table_info({table})") as cur:
+            existing = {row["name"] for row in await cur.fetchall()}
+        if column not in existing:
+            await db().execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+            logger.info("数据库迁移：%s 新增列 %s", table, column)
+    await db().commit()
+
 
 async def init_db() -> aiosqlite.Connection:
     global _conn
@@ -155,6 +177,7 @@ async def init_db() -> aiosqlite.Connection:
     _conn.row_factory = aiosqlite.Row
     await _conn.executescript(SCHEMA)
     await _conn.commit()
+    await _migrate()
     return _conn
 
 
@@ -343,13 +366,14 @@ async def upsert_notification(data: dict) -> str:
         # 保留人工修正：只覆盖机器字段，correction 表不动
         await execute(
             """UPDATE notification SET
-                 title=?, summary=?, due_at=?, due_text=?, due_confidence=?,
+                 title=?, summary=?, location=?, due_at=?, due_text=?, due_confidence=?,
                  evidence=?, conflict=?, candidates=?, extractor=?, model=?,
                  prompt_ver=?, updated_at=?
                WHERE id=?""",
             (
                 data["title"],
                 data.get("summary"),
+                data.get("location"),
                 data.get("due_at"),
                 data.get("due_text"),
                 data.get("due_confidence", 0.0),
@@ -370,9 +394,9 @@ async def upsert_notification(data: dict) -> str:
     await execute(
         """INSERT INTO notification
            (id, raw_message_id, group_id, group_name, sender_id, sender_name, source_ts,
-            title, summary, due_at, due_text, due_confidence, evidence, conflict,
+            title, summary, location, due_at, due_text, due_confidence, evidence, conflict,
             candidates, extractor, model, prompt_ver, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             notif_id,
             data["raw_message_id"],
@@ -383,6 +407,7 @@ async def upsert_notification(data: dict) -> str:
             data["source_ts"],
             data["title"],
             data.get("summary"),
+            data.get("location"),
             data.get("due_at"),
             data.get("due_text"),
             data.get("due_confidence", 0.0),

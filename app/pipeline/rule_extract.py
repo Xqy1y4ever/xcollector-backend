@@ -31,8 +31,43 @@ NOTICE_KEYWORDS = re.compile(
 # 强调词，提升置信度
 EMPHASIS = re.compile(r"务必|请|要求|全体|注意|重要|截止|必须")
 
+# 地点：规则抽取不可能做得好，只求"原文明确写了、且能高置信度认出"这几种形态。
+# 三种优先级从高到低：
+#   1. 「地点：xxx」显式标注
+#   2. 「在/于/到 + 以场所后缀结尾的词」——如 在教三201、到学工办、于体育馆
+#   3. 「在/于/到 + 楼名+房间号」——如 在教三201、于主教304（中文场所名常不带后缀）
+# 通不过就返回 None，交给 LLM 那条路。宁可没有地点，也不要抽出一个错的。
+VENUE_SUFFIX = (
+    r"(?:号楼|阶梯教室|会议室|办公室|学工办|教室|体育馆|图书馆|操场|广场|中心|校区|楼|馆|厅)"
+)
+PAT_LOCATION = re.compile(
+    r"(?:地点|地址|教室)\s*[:：]\s*([^\s，。；,;、]{2,20})"
+    # 前缀用**贪婪**匹配 + 排除数字，否则：
+    #   懒匹配会跨过整个句子（「于9月20日前到图书馆」被当成地点），
+    #   而数字会让你停在房间号中间。
+    # {0,12} 允许前缀为空，否则「学工办」这种整体就是场所名的词匹配不上。
+    r"|(?:在|于|到|去)\s*([^\s，。；,;、0-9]{0,12}" + VENUE_SUFFIX + r")"
+    r"|(?:在|于|到|去)\s*([\u4e00-\u9fff]{1,4}\d{3,4})"
+)
+
 MAX_TITLE = 40
 MAX_SUMMARY = 160
+
+
+def rule_location(text: str) -> str | None:
+    """从原文里认出一个明确写出的地点，认不出返回 None。"""
+    if not text:
+        return None
+    m = PAT_LOCATION.search(text)
+    if not m:
+        return None
+    for group in m.groups():
+        if group:
+            value = group.strip()[:60]
+            # 「在…上」「到…中」这类多半是虚指，不是地点
+            if value and not value.endswith(("上", "中", "下", "时")):
+                return value
+    return None
 
 
 def _strip_leading_marks(text: str) -> str:
@@ -92,6 +127,7 @@ def rule_extract(content: str, ts_ms: int, at_all: bool = False) -> dict | None:
     return {
         "title": title,
         "summary": body[:MAX_SUMMARY] if body else None,
+        "location": rule_location(body),
         "due_at": guess.due_at if guess else None,
         "due_text": guess.due_text if (guess and guess.due_text) else None,
         "due_confidence": guess.confidence if guess else 0.0,

@@ -21,7 +21,7 @@ from ..utils import iso_local, now_ms, parse_iso_to_ms, to_local
 
 logger = logging.getLogger(__name__)
 
-PROMPT_VER = "llm-v1"
+PROMPT_VER = "llm-v2"  # v2: 新增 location 抽取
 
 _WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
@@ -33,6 +33,7 @@ SYSTEM_PROMPT = """你是一个官方通知抽取器。输入是 QQ 群里发布
 3. 拿不准的时候，宁可把 due_at 填 null、只在 due_text 里保留原文的时间说法，也**不许猜**一个具体时间。猜错的时间比没有时间危害更大，因为用户会直接相信它。
 4. 只有闲聊、回执（"收到""好的""谢谢老师"）、纯表情、广告、纯提问，才算 is_notification=false。凡是让人做事、或告知安排的信息，都算 true。
 5. 一条消息里如果有多个截止时间，只抽取最主要的那一个，并在 summary 里说明其他安排。
+6. location 必须是原文里**明确写出**的地点（教室、办公室、场馆、校区、线上平台等）。原文没写就填 null，**不许根据常识推测**（比如"交到班长那里"不算地点，"在教三201开会"才算）。
 
 【相对时间】
 原文里的"下周三""明天""本周五"等相对说法，一律以**消息发送时间**为锚点计算，不要用今天。
@@ -44,6 +45,7 @@ SYSTEM_PROMPT = """你是一个官方通知抽取器。输入是 QQ 群里发布
   "is_notification": true 或 false,
   "title": "不超过 20 字的动作标题，祈使句，例如「提交军训心得」",
   "summary": "一到两句话说明要求做什么，不超过 100 字",
+  "location": "原文里明确写出的地点，例如「教三201」「学工办」；原文没写就填 null",
   "due_at": "ISO8601 时间，必须带时区偏移，例如 2025-09-12T23:59:00+08:00；无法确定时填 null",
   "due_text": "原文里的时间说法，逐字复制，例如「下周三前」；原文没有就填 null",
   "due_confidence": 0.0 到 1.0 之间的数字，表示你对 due_at 的把握，
@@ -57,6 +59,7 @@ class LLMNotification(BaseModel):
     is_notification: bool = False
     title: str = ""
     summary: str = ""
+    location: str | None = None
     due_at: str | None = None
     due_text: str | None = None
     due_confidence: float = Field(default=0.0, ge=0.0, le=1.0)
@@ -243,6 +246,7 @@ def finalize(
     return {
         "title": title,
         "summary": (parsed.summary or "").strip()[:300] or None,
+        "location": (parsed.location or "").strip()[:60] or None,
         "due_at": due_at,
         "due_text": (parsed.due_text or "").strip() or None,
         "due_confidence": round(due_confidence, 3),

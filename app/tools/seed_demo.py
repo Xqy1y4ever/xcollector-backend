@@ -17,7 +17,7 @@ import time
 from ..config import get_settings
 from ..db import close_db, execute, init_db
 from ..logging_setup import setup_logging
-from ..pipeline.ingest import handle_event, close_http
+from ..pipeline.ingest import close_http, handle_message
 from ..utils import local_day
 
 # (文本, 发送者QQ, 发送者昵称, 多少分钟前, 是否@全体成员)
@@ -80,25 +80,24 @@ async def main() -> int:
         if senders and sender_id not in senders and settings.sender_whitelist_mode == "strict":
             # 让演示数据至少有一部分能通过白名单，方便观察 skipped_whitelist 状态
             pass
-        message: list[dict] = []
-        if at_all:
-            message.append({"type": "at", "data": {"qq": "all", "name": ""}})
-        message.append({"type": "text", "data": {"text": (" " if at_all else "") + text}})
-
-        event = {
-            "post_type": "message",
-            "message_type": "group",
-            "sub_type": "normal",
-            "self_id": "999999",
-            "group_id": group_id,
-            "user_id": sender_id,
+        # 注入的是 bot 会推过来的**归一化消息**，不是 OneBot 原始事件 ——
+        # 这样演示数据和真实链路的入口完全一致。
+        message = {
+            "source": "qq",
             "message_id": f"seed-{idx:02d}",
-            "time": now - minutes_ago * 60,
-            "raw_message": text,
-            "sender": {"user_id": sender_id, "nickname": sender_name, "card": sender_name},
-            "message": message,
+            "group_id": group_id,
+            "group_name": settings.group_display_names.get(group_id),
+            "sender_id": sender_id,
+            "sender_name": sender_name,
+            "ts": (now - minutes_ago * 60) * 1000,
+            "text": ("@全体成员 " if at_all else "") + text,
+            "at_all": at_all,
+            "mentions": [],
+            "reply_to": None,
+            "attachments": [],
+            "raw": {"seed": True},
         }
-        await handle_event(event)
+        await handle_message(message)
         injected += 1
 
     print(f"已注入 {injected} 条演示消息")

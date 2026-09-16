@@ -1,8 +1,11 @@
-"""事件接入：OneBot 事件 → 原始层。
+"""归一化消息接入：bot 推过来的消息 → 原始层。
 
 职责边界（很重要）：
   这一层**只负责把消息无损搬进来**，不做任何"有效性判断"。
   任何消息都不在这里被丢弃 —— 唯一例外是"不在群白名单里"（那是用户显式配置的边界）。
+
+拆分之后这一层不认识 OneBot 协议：合并转发已由 bot 展开成纯文本，
+我们收到的就是 `{group_id, sender_id, ts, text, attachments, ...}`。
 """
 
 from __future__ import annotations
@@ -12,15 +15,14 @@ import mimetypes
 import re
 import time
 from pathlib import Path
+from typing import Any, Iterable
 
 import httpx
 
 from ..config import get_settings
 from ..db import add_gap_alert, insert_raw_message, set_raw_state, touch_group
-from ..onebot import get_hub, parse_message
-from ..onebot.segments import Attachment
 from .runner import process_raw
-from .trace import event_meta, log_message
+from .trace import log_message, message_meta
 
 logger = logging.getLogger(__name__)
 
@@ -43,73 +45,35 @@ async def close_http() -> None:
 
 
 # --------------------------------------------------------------------------
-# 合并转发展开
-# --------------------------------------------------------------------------
-
-
-async def _expand_forwards(
-    parsed_text: str, forward_ids: list[str], depth: int, seen: set[str]
-) -> str:
-    """递归展开合并转发。
-
-    NapCat 对合并转发的消息体是空的，只有 id。不展开的话这条通知就没了。
-    """
-    settings = get_settings()
-    if not forward_ids or depth >= settings.forward_max_depth:
-        return parsed_text
-
-    hub = get_hub()
-    chunks: list[str] = [parsed_text] if parsed_text.strip() else []
-    for fid in forward_ids:
-        if fid in seen:
-            continue
-        seen.add(fid)
-        try:
-            nodes = await hub.get_forward_msg(fid)
-        except Exception as exc:
-            logger.warning("展开合并转发失败 id=%s: %s", fid, exc)
-            chunks.append(f"[合并转发展开失败: {fid}]")
-            continue
-
-        lines: list[str] = []
-        for node in nodes:
-            inner = parse_message(node.get("message") or node.get("content") or [])
-            sender = (node.get("sender") or {}).get("nickname") or ""
-            nested = await _expand_forwards(
-                inner.text, inner.forwards, depth + 1, seen
-            )
-            lines.append(f"  <{sender}> {nested}")
-        if lines:
-            chunks.append("[合并转发内容]\n" + "\n".join(lines))
-    return "\n".join(c for c in chunks if c.strip())
-
-
-# --------------------------------------------------------------------------
 # 附件落地
 # --------------------------------------------------------------------------
 
 
-def _guess_ext(att: Attachment, content_type: str | None) -> str:
+def _guess_ext(att: dict, content_type: str | None) -> str:
     if content_type:
         ext = mimetypes.guess_extension(content_type.split(";")[0].strip())
         if ext:
             return ext
-    if att.name and "." in att.name:
-        return "." + att.name.rsplit(".", 1)[1][:8]
-    if att.url:
-        suffix = Path(att.url.split("?")[0]).suffix
+    name = att.get("name")
+    if name and "." in name:
+        return "." + name.rsplit(".", 1)[1][:8]
+    url = att.get("url")
+    if url:
+        suffix = Path(url.split("?")[0]).suffix
         if suffix and len(suffix) <= 8:
             return suffix
     return ".bin"
 
 
 async def _download_attachments(
-    group_id: str, message_id: str, attachments: list[Attachment]
+    group_id: str, message_id: str, attachments: list[dict]
 ) -> None:
-    """把附件下载到本地。
+    """把附件下载到本地（就地写入 `local_path` / `download_error`）。
 
-    NapCat 给的 URL 有时效性，过期就再也取不回来了 ——
-    所以"落地保存"是硬要求，下载失败也要留下明确痕迹。
+    bot 那边只透传 URL，因为文件必须保存在**后端**这一侧，
+    否则前后端分开部署时前端就取不到图了。
+    而 URL 有时效性，过期就再也取不回来 —— 所以落地是硬要求，
+    下载失败也要在附件上留下明确痕迹，而不是悄悄跳过。
     """
     settings = get_settings()
     if not settings.media_download_enabled or not attachments:
@@ -119,24 +83,27 @@ async def _download_attachments(
     out_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, att in enumerate(attachments):
-        if not att.url:
-            att.download_error = "该附件没有可用 URL（OneBot 未提供）"
+        url = att.get("url")
+        if not url:
+            att["download_error"] = "该附件没有可用 URL（bot 未提供）"
             continue
         try:
-            resp = await _client().get(att.url)
+            resp = await _client().get(url)
             resp.raise_for_status()
             body = resp.content
             if len(body) > settings.media_max_bytes:
-                att.download_error = f"附件超过大小上限 ({len(body)} bytes)"
+                att["download_error"] = f"附件超过大小上限 ({len(body)} bytes)"
                 continue
             ext = _guess_ext(att, resp.headers.get("content-type"))
             stem = _SAFE.sub("_", f"{group_id}_{message_id}_{idx}")
             path = out_dir / f"{stem}{ext}"
             path.write_bytes(body)
-            att.local_path = str(path.relative_to(settings.resolved_attachment_dir.parent.parent))
+            att["local_path"] = str(
+                path.relative_to(settings.resolved_attachment_dir.parent.parent)
+            )
         except Exception as exc:
-            att.download_error = f"{type(exc).__name__}: {exc}"
-            logger.warning("附件下载失败 %s: %s", att.url[:120], exc)
+            att["download_error"] = f"{type(exc).__name__}: {exc}"
+            logger.warning("附件下载失败 %s: %s", str(url)[:120], exc)
 
 
 # --------------------------------------------------------------------------
@@ -144,61 +111,53 @@ async def _download_attachments(
 # --------------------------------------------------------------------------
 
 
-async def handle_event(event: dict) -> None:
+async def handle_message(message: dict) -> str:
+    """处理一条归一化消息。返回粗粒度的结局，供 API 统计。
+
+    结局：accepted | duplicate | group_filtered | skipped_whitelist | error
+    （更细的结局 extracted/noise/unparsed/degraded 由 runner 记在日志里）
+    """
     settings = get_settings()
 
-    if event.get("post_type") != "message":
-        return
-    if event.get("message_type") != "group":
-        return  # MVP 只处理群消息
-    if str(event.get("self_id")) == str(event.get("user_id")):
-        return  # 机器人自己发的消息
+    group_id = str(message.get("group_id") or "")
+    sender_id = str(message.get("sender_id") or "")
+    message_id = str(message.get("message_id") or "")
 
-    group_id = str(event.get("group_id"))
-    sender_id = str(event.get("user_id"))
+    if not group_id or not message_id:
+        return "error"
 
-    ts = int(event.get("time", 0)) * 1000 or int(time.time() * 1000)
-    parsed = parse_message(event.get("message"))
+    ts = int(message.get("ts") or 0) or int(time.time() * 1000)
+    content = message.get("text") or ""
 
-    # 日志上下文：即使这条消息最终不入库（群不在白名单），也要能记一行
-    meta = event_meta(event, content=parsed.text, parsed=parsed)
+    meta = message_meta(message, content=content)
     meta["ts"] = ts
 
     if not settings.in_group_whitelist(group_id):
         # 白名单之外的群连库都不进。这类量可能很大，所以只记 DEBUG。
         log_message(meta, "group_filtered", 原因="群不在白名单")
-        return
+        return "group_filtered"
 
     try:
-        sender = event.get("sender") or {}
-        meta["sender_name"] = sender.get("card") or sender.get("nickname") or sender_id
-
-        group_name = settings.group_whitelist_map.get(group_id)
-        if group_name == group_id or group_name is None:
-            group_name = await _try_group_name(group_id)
-        meta["group_name"] = group_name
-
-        content = await _expand_forwards(parsed.text, parsed.forwards, 0, set())
-        meta["content"] = content
-
-        await _download_attachments(group_id, str(event.get("message_id")), parsed.attachments)
+        attachments: list[dict] = list(message.get("attachments") or [])
+        await _download_attachments(group_id, message_id, attachments)
 
         raw_id, is_new = await insert_raw_message(
-            message_id=str(event.get("message_id")),
+            message_id=message_id,
             group_id=group_id,
-            group_name=group_name,
+            group_name=message.get("group_name"),
             sender_id=sender_id,
-            sender_name=meta["sender_name"],
+            sender_name=message.get("sender_name") or sender_id,
             ts=ts,
             content=content,
-            attachments=[a.to_dict() for a in parsed.attachments],
-            raw=event,
+            attachments=attachments,
+            # 原始层的 raw 列留档整条归一化消息（含 bot 附上的原始事件）
+            raw=message,
         )
         if not is_new:
             log_message(meta, "duplicate")  # 重连后重复推送，只记 DEBUG
-            return
+            return "duplicate"
 
-        gap = await touch_group(group_id, group_name, ts)
+        gap = await touch_group(group_id, message.get("group_name"), ts)
         if gap:
             await add_gap_alert(
                 gap["group_id"],
@@ -216,20 +175,37 @@ async def handle_event(event: dict) -> None:
         if not settings.in_sender_whitelist(sender_id):
             await set_raw_state(raw_id, "skipped_whitelist", f"发送者 {sender_id} 不在白名单")
             log_message(meta, "skipped_whitelist", 原因=f"发送者 {sender_id} 不在白名单")
-            return
+            return "skipped_whitelist"
 
         # 最终结果由 runner 记录（extracted / noise / unparsed / degraded）
         await process_raw(raw_id)
+        return "accepted"
 
     except Exception as exc:
         # 兜底：任何未预期的异常也要留下这一条消息的记录，不能让它在日志里消失
         log_message(meta, "error", 原因=f"{type(exc).__name__}: {exc}")
-        raise
+        logger.exception("消息处理失败 msg_id=%s", message_id)
+        return "error"
 
 
-async def _try_group_name(group_id: str) -> str | None:
-    try:
-        info = await get_hub().get_group_info(group_id)
-        return info.get("group_name")
-    except Exception:
-        return None
+async def handle_messages(messages: Iterable[dict]) -> dict[str, Any]:
+    """批量入口。逐条处理，一条失败不影响其余。"""
+    counters: dict[str, int] = {}
+    for message in messages:
+        try:
+            outcome = await handle_message(message)
+        except Exception as exc:  # handle_message 内部已兜底，这里是双保险
+            logger.exception("批量接入时单条失败：%s", exc)
+            outcome = "error"
+        counters[outcome] = counters.get(outcome, 0) + 1
+
+    return {
+        "ok": True,
+        "received": sum(counters.values()),
+        "accepted": counters.get("accepted", 0),
+        "duplicates": counters.get("duplicate", 0),
+        "filtered": counters.get("group_filtered", 0),
+        "skipped": counters.get("skipped_whitelist", 0),
+        "errors": counters.get("error", 0),
+        "detail": counters,
+    }

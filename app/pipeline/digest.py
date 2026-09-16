@@ -21,8 +21,8 @@ from ..db import (
     list_gap_alerts,
     log_digest,
 )
+from ..bot_client import get_bot
 from ..materialize import build_views
-from ..onebot import get_hub
 from ..utils import local_day, now_ms, to_local
 
 logger = logging.getLogger(__name__)
@@ -79,6 +79,8 @@ async def build_digest() -> str:
     for v in fresh[:12]:
         lines.append(f"· {v['title']}")
         lines.append(f"  截止 {_fmt_due(v)}")
+        if v.get("location"):
+            lines.append(f"  地点 {v['location']}")
         lines.append(f"  来源 {v.get('group_name') or v.get('group_id')} · {v.get('sender_name') or ''}")
         lines.append(f"  「{v['evidence'][:60]}」")
     if len(fresh) > 12:
@@ -142,14 +144,10 @@ async def send_digest(dry_run: bool = True, kind: str = "manual") -> dict:
     if not settings.digest_target_qq:
         error = "未配置 DIGEST_TARGET_QQ，无法发送"
     else:
-        try:
-            resp = await get_hub().send_private_msg(settings.digest_target_qq, text)
-            if resp.get("status") == "failed" or resp.get("retcode") not in (0, None):
-                error = f"NapCat 返回异常：{resp}"
-            else:
-                sent = True
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
+        # bot 不可达不抛异常，返回 (ok, error)，这样调度循环还能继续跑
+        sent, error = await get_bot().send_private(settings.digest_target_qq, text)
+        if not sent and not error:
+            error = "bot 报告发送失败，但没给出原因"
 
     await log_digest(today, kind, text, sent=sent, error=error)
     return {"ok": sent, "sent": sent, "text": text, "error": error}

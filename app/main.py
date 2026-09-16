@@ -11,17 +11,17 @@ import asyncio
 import logging
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
 from .api import router
+from .bot_client import close_bot, get_bot
 from .config import get_settings
 from .db import close_db, init_db
 from .logging_setup import setup_logging
-from .onebot import get_hub
 from .pipeline.digest import digest_loop
-from .pipeline.ingest import close_http, handle_event
+from .pipeline.ingest import close_http
 from .pipeline.watchdog import silence_loop, startup_gap_check
 
 _settings = get_settings()
@@ -42,14 +42,22 @@ async def lifespan(app: FastAPI):
     )
     logger.info("抽取模式：%s", settings.extractor)
 
-    hub = get_hub()
-    hub.set_event_handler(handle_event)
-    await hub.start()
-    if settings.onebot_mode == "server":
+    # 后端不再持有 OneBot 连接：消息由 xcollector-bot 推到 POST /api/ingest/messages。
+    # 这里只做一次连通性探测，让启动日志能立刻暴露"bot 没起来"。
+    bot_status = await get_bot().status()
+    if bot_status.get("reachable"):
         logger.info(
-            "反向 WS 已监听：%s%s（请把 NapCat 的反向 WebSocket 指到这里）",
-            settings.onebot_listen_host,
-            settings.onebot_listen_path,
+            "bot 可达：%s（connected=%s, mode=%s）",
+            settings.bot_base_url,
+            bot_status.get("connected"),
+            bot_status.get("mode"),
+        )
+    else:
+        logger.warning(
+            "bot 不可达（%s）：%s —— 收不到 QQ 消息、也发不出 digest。"
+            "请确认 xcollector-bot 已启动。",
+            settings.bot_base_url,
+            bot_status.get("last_error"),
         )
 
     await startup_gap_check()
@@ -61,7 +69,7 @@ async def lifespan(app: FastAPI):
     finally:
         for t in _tasks:
             t.cancel()
-        await hub.stop()
+        await close_bot()
         await close_http()
         await close_db()
         logger.info("已关闭")
@@ -87,16 +95,9 @@ async def root():
         "version": __version__,
         "docs": "/docs",
         "api": "/api/notifications",
-        "onebot": get_hub().status(),
+        # OneBot 连接已经拆到 xcollector-bot；这里只是转发它的状态
+        "bot": await get_bot().status(),
     }
-
-
-if _settings.onebot_mode == "server":
-
-    @app.websocket(_settings.onebot_listen_path)
-    async def onebot_reverse_ws(websocket: WebSocket):
-        """NapCat「反向 WebSocket」的目标地址。"""
-        await get_hub().attach_server_ws(websocket)
 
 
 def main() -> None:

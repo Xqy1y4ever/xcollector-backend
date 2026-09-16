@@ -16,6 +16,23 @@ Python **3.12+**。
 
 ---
 
+## 在整套系统里的位置
+
+```
+QQ/NapCat ──OneBot WS──▶ xcollector-bot ──HTTP POST /api/ingest/messages──▶ xcollector-backend
+                              ▲                                                    │
+                              └──────── HTTP POST /api/send/private ◀───────────────┤
+                                                                                   │
+                                                              xcollector-web ◀─────┘
+```
+
+**本服务不认识 OneBot 协议。** OneBot/NapCat 连接、消息段解析、合并转发展开、
+私聊指令全部在 [`xcollector-bot`](../xcollector-bot/) 里；后端只消费归一化后的消息，
+并通过 `BOT_BASE_URL` 调 bot 发消息。这样两边可以分别部署、分别重启，
+换掉 QQ 实现也不影响抽取和存储。
+
+---
+
 ## 快速开始
 
 ```bash
@@ -26,51 +43,71 @@ pip install -r requirements.txt   # 核心依赖，不含 litellm
 
 # 2. 复制配置
 copy .env.example .env
-#    至少改这三项：GROUP_WHITELIST / SENDER_WHITELIST / DIGEST_TARGET_QQ
+#    至少改这两项：GROUP_WHITELIST / DIGEST_TARGET_QQ
 
-# 3. 先不接 QQ，用演示数据验证整条链路（无需 API key）
+# 3. 不接 QQ、不接 bot，用演示数据验证整条链路（无需 API key）
 python -m app.tools.seed_demo --reset --extractor rule
 
 # 4. 起服务
 python -m app.main
 #    API:  http://127.0.0.1:8000/docs
 #    前端: 另开一个终端跑 xcollector-web
+#    bot:  另开一个终端跑 xcollector-bot（不跑就收不到 QQ 消息）
 ```
 
-跑通之后再接 NapCat（见下）和 LLM。
+启动时会探测一次 bot 连通性：bot 没起来会打一条 WARNING，但服务照常运行
+（演示数据和前端仍可用）。
 
 ---
 
-## NapCatQQ 配置（你自己做，本服务只负责连）
+## 与 bot 的两个方向
 
-本服务**不管理 NapCat**，只按 [OneBot 11](https://github.com/botuniverse/onebot-11) 协议连上去。
-NapCat 的安装与登录请参考它的官方文档；这里只说明**网络配置这一项**怎么和本服务对上。
+### bot → 后端：`POST /api/ingest/messages`
 
-两种模式二选一，`.env` 里的 `ONEBOT_MODE` 要和 NapCat 那边的配置对应。
+bot 把 QQ 消息规范化成下面这个结构推过来（合并转发已在 bot 侧展开成纯文本）：
 
-### 模式 A：`ONEBOT_MODE=client`（本服务主动连 NapCat）
+```json
+{
+  "messages": [
+    {
+      "source": "qq",
+      "message_id": "12345",
+      "group_id": "673504310",
+      "group_name": "NOVA官方通知群",
+      "sender_id": "10001",
+      "sender_name": "李老师",
+      "ts": 1757692800000,
+      "text": "@全体成员 大家下周三前把军训心得交到班长那里，不少于800字。",
+      "at_all": true,
+      "mentions": [],
+      "reply_to": null,
+      "attachments": [{"type": "image", "url": "https://...", "name": null, "size": null}],
+      "raw": {}
+    }
+  ]
+}
+```
 
-1. 在 NapCat 里新建一个 **WebSocket 服务**（正向 WS Server）。
-2. 端口填 `3001`；如果设了 Token，把同样的值填到 `.env` 的 `ONEBOT_ACCESS_TOKEN`。
-3. `.env` 里 `ONEBOT_WS_URL=ws://127.0.0.1:3001`（NapCat 不在本机就换成实际 IP）。
+**群白名单和发送者白名单在后端判定**，所以 bot 不需要知道你的策略，照单全推即可。
+响应会给出 `accepted / duplicates / filtered / skipped / errors` 的计数。
 
-本服务会自动重连（指数退避，最长 60 秒一次），断线不会退出进程。
+附件由**后端**下载落盘（bot 只透传 URL）——文件必须存在后端这一侧，
+否则前后端分开部署时前端就取不到图了。
 
-### 模式 B：`ONEBOT_MODE=server`（NapCat 连过来）
+### 后端 → bot：发送与状态
 
-1. 在 NapCat 里新建一个 **反向 WebSocket**。
-2. URL 填 `ws://127.0.0.1:8081/onebot/ws`。
-3. `.env` 里保持 `ONEBOT_MODE=server`。
+| 后端调用 | 用途 |
+|---|---|
+| `POST {BOT_BASE_URL}/api/send/private` | 每日 digest |
+| `POST {BOT_BASE_URL}/api/send/group` | （当前未使用，留给后续） |
+| `GET {BOT_BASE_URL}/api/status` | 健康页显示连接状态 |
 
-> 两种模式只能用一个。同时开会让同一条消息进来两次（虽然 `(group_id, message_id)`
-> 有唯一约束不会重复入库，但没必要）。
+认证：bot 推过来时带 `INGEST_API_TOKEN`，后端调过去时带 `BOT_API_TOKEN`。
+四个值（两边的两份）要一一对上；都不填则不校验，仅限本地开发。
 
-### 一定要做的一件事
+---
 
-**用非主号。** NapCat 属于协议实现，QQ 客户端升级后可能失效，也存在账号风险。
-用一个小号待在官方群里即可。
-
-### 还有一件事
+## 掉线期间的漏洞
 
 NapCat 靠**实时事件推送**，历史消息拉取能力有限且不稳定。
 所以 **bot 掉线期间的消息会永久消失**。本服务为此做了缺口检测：
@@ -189,6 +226,9 @@ tokens=812 | 附件=1 | 原文=@全体成员 大家下周三前把军训心得�
 # 中文时间解析回归（18 条断言，锚点固定，不随运行日期漂移）
 python -m tests.check_timeparse
 
+# 地点抽取回归（14 条；一半用例期望「抽不出来」，因为错抽比漏抽更糟）
+python -m tests.check_location
+
 # 人工修正不被重跑抽取覆盖
 python -m tests.check_corrections
 
@@ -197,6 +237,10 @@ python -m tests.check_message_log
 
 # 注入演示数据跑通全链路
 python -m app.tools.seed_demo --reset --extractor rule
+
+# HTTP 接口冒烟（需要另开一个终端跑着后端，且必须用 EXTRACTOR=rule）
+#   $env:EXTRACTOR='rule'; python -m app.main
+#   $env:SMOKE_BASE='http://127.0.0.1:8000'; python -m tests.check_api
 ```
 
 ---
@@ -207,14 +251,25 @@ python -m app.tools.seed_demo --reset --extractor rule
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
+| POST | `/ingest/messages` | **bot 推消息进来的入口**。见上一节 |
+| POST | `/tasks/manual` | 手动建任务（QQ 里 `/add` 指令的后端支撑）。`auto_commit=false` 只解析不入库；`force_commit=true` 无论有没有把握都建 |
 | GET | `/notifications` | 列表。支持 `since`（增量）、`status`、`q`；响应附带 `blindspots` |
-| GET | `/notifications/{id}` | 详情，含 `raw`（原文、附件、原始 OneBot JSON） |
-| POST | `/notifications/{id}/corrections` | 人工修正 `title`/`summary`/`due_at`/`due_text`/`status` |
+| GET | `/notifications/{id}` | 详情，含 `raw`（原文、附件、原始事件 JSON） |
+| POST | `/notifications/{id}/corrections` | 人工修正 `title`/`summary`/`location`/`due_at`/`due_text`/`status` |
 | POST | `/notifications/{id}/read` | 已读 / 未读 |
-| GET | `/health` | OneBot 连接、各群最后消息时间、流水线统计、缺口告警 |
+| GET | `/health` | bot 连接状态、各群最后消息时间、流水线统计、缺口告警、盲区 |
 | GET | `/digest/preview` | 预览每日摘要文本 |
 | POST | `/digest/send` | `{"dry_run": false}` 真的发到 QQ |
 | GET | `/config/meta` | 非敏感配置摘要 |
+
+`status` 的取值与含义：
+
+| 值 | 含义 | 前端表现 |
+|---|---|---|
+| `active` | 待办 | 正常显示 |
+| `expired` | 已过截止时间（自动推导，不是存的） | 归入「已过期」组 |
+| `done` | 做完了（QQ 里 `/done`，或前端「标记完成」） | 归入末尾的「已完成」组，弱化显示 |
+| `archived` | 不是通知 / 误报（QQ 里 `/del`） | 从主列表消失 |
 
 ---
 
@@ -223,18 +278,19 @@ python -m app.tools.seed_demo --reset --extractor rule
 ```
 app/
   config.py            配置（全部有默认值，缺 .env 也能启动）
-  db.py                SQLite schema 与数据访问
+  db.py                SQLite schema、增量迁移与数据访问
   materialize.py       correction 覆盖 notification，生成 API 视图
+  bot_client.py        调 xcollector-bot 的 HTTP 客户端（发消息、查状态）
   utils.py             ID / 时间换算
-  onebot/
-    segments.py        OneBot 消息段解析（合并转发、附件、@全体成员）
-    hub.py             正向 / 反向 WS 连接，自动重连
+  logging_setup.py     日志初始化（入口脚本共用）
   pipeline/
-    ingest.py          事件 → 原始层；合并转发展开；附件落地；缺口检测
+    ingest.py          归一化消息 → 原始层；附件落地；缺口检测
     runner.py          抽取编排（模式选择、降级、分歧标记）
+    manual.py          手动建任务（/add 指令），解析没把握时先回问
     extract.py         LLM 抽取（校验、重试、交叉验证）
-    rule_extract.py    确定性规则抽取
+    rule_extract.py    确定性规则抽取（含地点）
     timeparse.py       中文相对时间解析
+    trace.py           每条消息一行日志
     digest.py          每日摘要
     watchdog.py        静默 / 缺口看门狗
   api/routes.py        HTTP 接口
@@ -243,14 +299,17 @@ app/
 tests/                 自检脚本
 ```
 
+> `onebot/`（消息段解析、WS 连接）已经搬到
+> [`xcollector-bot`](../xcollector-bot/) —— 后端不再持有 QQ 连接。
+
 ---
 
 ## 分层铁律
 
 | 层 | 可变性 | 说明 |
 |---|---|---|
-| `raw_message` | **只追加** | 唯一不可再生的资产。含原始 OneBot JSON，永不修改 |
-| `notification` | 可整表重建 | 派生层。改 prompt、换模型后可重跑 |
+| `raw_message` | **只追加** | 唯一不可再生的资产。含 bot 送来的完整消息与原始事件 JSON，永不修改 |
+| `notification` | 可整表重建 | 派生层。改 prompt、换模型后可重跑。加 `location` 列时走 `ALTER TABLE`，老数据该列为 NULL |
 | `correction` | **只追加** | 人工修正。展示时覆盖 `notification`，所以**重跑永远不会冲掉你改过的 DDL** |
 | `task_event` 等 | — | 本 MVP 未引入显式任务状态机（见「已知边界」） |
 
@@ -262,11 +321,16 @@ tests/                 自检脚本
    如果 DDL 藏在附件里，只能靠人打开看。这是当前最大的漏信息通道。
 2. **没有任务状态机。** 没有"改期 / 取消 / 合并同一条通知的多条消息"。
    目前一条原始消息对应一条通知；同一条通知被重发会生成多条。
-3. **没有评测集。** `tests/` 里只有时间解析的回归断言。要回答"抽取准确率是多少"，
+   （QQ 里的 `/done`、`/del` 只是改 `status`，不是完整状态机。）
+3. **地点抽取以规则为主。** 规则只认「地点：xxx」和「在/到 + 场所词」这两类明确形态，
+   认不出就交给 LLM；LLM 也可能给 null。**宁可为空，也不硬猜**——
+   用户会照着错的地点跑一趟。前端已支持人工补正。
+4. **没有评测集。** `tests/` 里只有时间解析和地点抽取的回归断言。要回答"抽取准确率是多少"，
    需要按设计文档 §7 手工标注 200~300 条真实消息。
-4. **未解析 / 降级只是计数**，前端能看到数量，但还不能逐条点开看是哪些消息。
-5. **digest 只推私聊**，没有邮件通道。
-6. **不适合多进程部署**：SQLite + 单写入进程。要多 worker 请换 Postgres。
+5. **未解析 / 降级只是计数**，前端能看到数量，但还不能逐条点开看是哪些消息。
+6. **digest 只推私聊**，没有邮件通道。
+7. **不适合多进程部署**：SQLite + 单写入进程。要多 worker 请换 Postgres。
+8. **`/api/ingest/messages` 没有限流**：bot 推多少就处理多少。目前靠 bot 侧批量推送控制频率。
 
 这些都在 `docs/design.md` 的路线图里有对应条目。
 

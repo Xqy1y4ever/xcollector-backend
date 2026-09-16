@@ -53,13 +53,13 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # ---------------- OneBot ----------------
-    onebot_mode: Literal["client", "server"] = "client"
-    onebot_ws_url: str = "ws://127.0.0.1:3001"
-    onebot_access_token: str = ""
-    onebot_listen_host: str = "0.0.0.0"
-    onebot_listen_port: int = 8081
-    onebot_listen_path: str = "/onebot/ws"
+    # ---------------- Bot（OneBot 连接已拆到独立的 xcollector-bot 仓库）----------------
+    # 后端不认识 OneBot 协议，所有触达 QQ 的动作都走这几个配置指向的 HTTP 接口。
+    bot_base_url: str = "http://127.0.0.1:8082"
+    bot_api_token: str = ""
+    bot_timeout: float = 15.0
+    # bot 推消息进来时要带的令牌；为空则不校验（仅本地开发）
+    ingest_api_token: str = ""
 
     # ---------------- 白名单 ----------------
     group_whitelist: str = ""
@@ -114,6 +114,17 @@ class Settings(BaseSettings):
     @property
     def sender_whitelist_map(self) -> dict[str, str]:
         return {item["id"]: item["name"] for item in parse_id_name_pairs(self.sender_whitelist)}
+
+    @property
+    def group_display_names(self) -> dict[str, str | None]:
+        """群白名单的显示名；**没写名字时返回 None 而不是把群号当名字**。
+
+        `GROUP_WHITELIST=673504310` 这种写法很常见，如果直接把 id 当名字，
+        健康页就会显示「群名：673504310」，看起来像解析错了。
+        返回 None 之后前端会退化成显示群号，语义清楚得多。
+        真实群名由 bot 通过 get_group_info 随消息带过来。
+        """
+        return {k: (None if v == k else v) for k, v in self.group_whitelist_map.items()}
 
     @property
     def group_ids(self) -> set[str]:

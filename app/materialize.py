@@ -28,6 +28,7 @@ def _effective(row: dict, corr: dict) -> dict:
     due_text = row.get("due_text")
     title = row.get("title")
     summary = row.get("summary")
+    location = row.get("location")
 
     if "due_at" in corr:
         due_at = _correction_to_value("due_at", corr["due_at"])
@@ -37,6 +38,9 @@ def _effective(row: dict, corr: dict) -> dict:
         title = corr["title"]
     if "summary" in corr:
         summary = corr["summary"]
+    # location 允许被人工清空（空字符串即"原文没写地点"），所以不能像 title 那样判真假
+    if "location" in corr:
+        location = corr["location"] or None
 
     if "status" in corr and corr["status"]:
         status = corr["status"]
@@ -62,6 +66,7 @@ def _effective(row: dict, corr: dict) -> dict:
         "sender_name": row.get("sender_name"),
         "title": title,
         "summary": summary,
+        "location": location,
         "due_at": due_at,
         "due_text": due_text,
         "due_confidence": row.get("due_confidence") or 0.0,
