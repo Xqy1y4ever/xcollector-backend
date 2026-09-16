@@ -1,0 +1,4 @@
+# 启用 LLM 抽取时才需要（EXTRACTOR=llm 或 both）
+# litellm 依赖较重，且对新版 Python 的支持可能滞后；核心链路不依赖它。
+-r requirements.txt
+litellm>=1.50.0
