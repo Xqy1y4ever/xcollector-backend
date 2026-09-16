@@ -97,6 +97,12 @@ class Settings(BaseSettings):
     server_port: int = 8000
     cors_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
 
+    # ---------------- 日志 ----------------
+    # INFO 时每条消息一行；改成 DEBUG 还能看到"群不在白名单"和"重复推送"这两类。
+    log_level: str = "INFO"
+    # 消息日志里原文预览的最大长度
+    log_preview_chars: int = 60
+
     forward_max_depth: int = 3
 
     # ---------------- 派生属性 ----------------

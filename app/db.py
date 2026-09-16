@@ -38,7 +38,8 @@ CREATE TABLE IF NOT EXISTS raw_message (
   attachments   TEXT NOT NULL DEFAULT '[]',-- JSON: [{type,url,local_path,extracted_text}]
   raw           TEXT NOT NULL,             -- OneBot 原始事件 JSON，永不丢字段
   ingested_at   INTEGER NOT NULL,
-  -- 处理状态：pending | extracted | skipped_whitelist | unparsed | degraded
+  -- 处理状态：pending | extracted | noise | skipped_whitelist | unparsed | degraded
+  -- noise = 判定为闲聊/回执，属于正常结果；unparsed/degraded 才是真正的盲区
   state         TEXT NOT NULL DEFAULT 'pending',
   state_reason  TEXT,
   state_at      INTEGER,

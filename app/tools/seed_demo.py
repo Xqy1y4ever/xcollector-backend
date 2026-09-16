@@ -16,6 +16,7 @@ import time
 
 from ..config import get_settings
 from ..db import close_db, execute, init_db
+from ..logging_setup import setup_logging
 from ..pipeline.ingest import handle_event, close_http
 from ..utils import local_day
 
@@ -49,6 +50,8 @@ async def main() -> int:
     if args.extractor:
         settings.extractor = args.extractor
 
+    # 必须先配置 logging，否则下面每条消息一行的 INFO 记录不会显示出来
+    setup_logging()
     await init_db()
 
     if args.reset:

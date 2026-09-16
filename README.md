@@ -149,6 +149,40 @@ LLM_PRIMARY_MODEL=<一个支持视觉的模型>
 
 ---
 
+## 日志
+
+**每一条被处理的消息都会打印一行**结构化记录，便于 `grep`：
+
+```
+20:09:13 INFO    xcollector.message | 结果=extracted | 群=NOVA官方通知群(673504310) |
+发送者=李老师 | msg_id=seed-01 | 发送时间=09-16 16:49:13 | 标题=提交军训心得 |
+截止=09-23 23:59(下周三前) | 置信度=0.7 | 抽取器=llm | 模型=deepseek/deepseek-flash |
+tokens=812 | 附件=1 | 原文=@全体成员 大家下周三前把军训心得交到班长那里…
+```
+
+（上面为了可读性折了行，实际输出是**一行**。）
+
+`结果=` 的取值与数据库 `raw_message.state` 一一对应：
+
+| 结果 | 级别 | 含义 |
+|---|---|---|
+| `extracted` | INFO | 成功建条。附带标题、截止时间（含原文说法）、置信度、模型、token 数、附件数 |
+| `noise` | INFO | 判定为闲聊/回执。**属于正常结果**，不计入盲区 |
+| `skipped_whitelist` | INFO | 发送者不在白名单。消息已入库，只是不抽取 |
+| `group_filtered` | DEBUG | 群不在白名单。连库都不进 |
+| `duplicate` | DEBUG | 重复推送（重连后常见） |
+| `unparsed` | **WARNING** | 本该抽出却没抽出（如 evidence 为空被拒绝建条）—— 真盲区 |
+| `degraded` | **WARNING** | LLM 失败且规则也没兜住 —— 真盲区 |
+| `error` | **WARNING** | 流程抛出未预期异常 |
+
+把 `LOG_LEVEL` 改成 `DEBUG` 就能同时看到 `group_filtered` 和 `duplicate` 这两类
+（它们量大且重复，默认不显示）。`LOG_PREVIEW_CHARS` 控制原文预览长度。
+
+> `noise` 与 `unparsed` 是分开的：闲聊不该让"未能解析"这个数字虚高，
+> 否则盲区面板就失去了意义 —— 一个总是报警的数字等于没报警。
+
+---
+
 ## 自检
 
 ```bash
@@ -157,6 +191,9 @@ python -m tests.check_timeparse
 
 # 人工修正不被重跑抽取覆盖
 python -m tests.check_corrections
+
+# 每条消息恰好一行日志（6 种结局各一条）
+python -m tests.check_message_log
 
 # 注入演示数据跑通全链路
 python -m app.tools.seed_demo --reset --extractor rule

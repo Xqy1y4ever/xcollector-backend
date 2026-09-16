@@ -20,6 +20,7 @@ from ..db import add_gap_alert, insert_raw_message, set_raw_state, touch_group
 from ..onebot import get_hub, parse_message
 from ..onebot.segments import Attachment
 from .runner import process_raw
+from .trace import event_meta, log_message
 
 logger = logging.getLogger(__name__)
 
@@ -156,55 +157,74 @@ async def handle_event(event: dict) -> None:
     group_id = str(event.get("group_id"))
     sender_id = str(event.get("user_id"))
 
-    if not settings.in_group_whitelist(group_id):
-        return  # 白名单之外的群，连库都不进
-
     ts = int(event.get("time", 0)) * 1000 or int(time.time() * 1000)
     parsed = parse_message(event.get("message"))
 
-    sender = event.get("sender") or {}
-    sender_name = sender.get("card") or sender.get("nickname") or sender_id
-    group_name = settings.group_whitelist_map.get(group_id)
-    if group_name == group_id or group_name is None:
-        group_name = await _try_group_name(group_id)
+    # 日志上下文：即使这条消息最终不入库（群不在白名单），也要能记一行
+    meta = event_meta(event, content=parsed.text, parsed=parsed)
+    meta["ts"] = ts
 
-    content = await _expand_forwards(parsed.text, parsed.forwards, 0, set())
-    await _download_attachments(group_id, str(event.get("message_id")), parsed.attachments)
-
-    raw_id, is_new = await insert_raw_message(
-        message_id=str(event.get("message_id")),
-        group_id=group_id,
-        group_name=group_name,
-        sender_id=sender_id,
-        sender_name=sender_name,
-        ts=ts,
-        content=content,
-        attachments=[a.to_dict() for a in parsed.attachments],
-        raw=event,
-    )
-    if not is_new:
-        return  # 重复消息（重连后重复推送等），不重复处理
-
-    gap = await touch_group(group_id, group_name, ts)
-    if gap:
-        await add_gap_alert(
-            gap["group_id"],
-            gap["group_name"],
-            gap["from_ts"],
-            gap["to_ts"],
-            reason=(
-                f"两条消息间隔 {round((gap['to_ts'] - gap['from_ts']) / 3600000, 1)} 小时，"
-                "可能有消息在断线期间丢失，请手工核对"
-            ),
-        )
-        logger.warning("检测到消息缺口：群 %s", group_id)
-
-    # 发送者白名单：名单外的消息只入库、不抽取
-    if not settings.in_sender_whitelist(sender_id):
-        await set_raw_state(raw_id, "skipped_whitelist", f"发送者 {sender_id} 不在白名单")
+    if not settings.in_group_whitelist(group_id):
+        # 白名单之外的群连库都不进。这类量可能很大，所以只记 DEBUG。
+        log_message(meta, "group_filtered", 原因="群不在白名单")
         return
 
-    await process_raw(raw_id)
+    try:
+        sender = event.get("sender") or {}
+        meta["sender_name"] = sender.get("card") or sender.get("nickname") or sender_id
+
+        group_name = settings.group_whitelist_map.get(group_id)
+        if group_name == group_id or group_name is None:
+            group_name = await _try_group_name(group_id)
+        meta["group_name"] = group_name
+
+        content = await _expand_forwards(parsed.text, parsed.forwards, 0, set())
+        meta["content"] = content
+
+        await _download_attachments(group_id, str(event.get("message_id")), parsed.attachments)
+
+        raw_id, is_new = await insert_raw_message(
+            message_id=str(event.get("message_id")),
+            group_id=group_id,
+            group_name=group_name,
+            sender_id=sender_id,
+            sender_name=meta["sender_name"],
+            ts=ts,
+            content=content,
+            attachments=[a.to_dict() for a in parsed.attachments],
+            raw=event,
+        )
+        if not is_new:
+            log_message(meta, "duplicate")  # 重连后重复推送，只记 DEBUG
+            return
+
+        gap = await touch_group(group_id, group_name, ts)
+        if gap:
+            await add_gap_alert(
+                gap["group_id"],
+                gap["group_name"],
+                gap["from_ts"],
+                gap["to_ts"],
+                reason=(
+                    f"两条消息间隔 {round((gap['to_ts'] - gap['from_ts']) / 3600000, 1)} 小时，"
+                    "可能有消息在断线期间丢失，请手工核对"
+                ),
+            )
+            logger.warning("检测到消息缺口：群 %s", group_id)
+
+        # 发送者白名单：名单外的消息只入库、不抽取
+        if not settings.in_sender_whitelist(sender_id):
+            await set_raw_state(raw_id, "skipped_whitelist", f"发送者 {sender_id} 不在白名单")
+            log_message(meta, "skipped_whitelist", 原因=f"发送者 {sender_id} 不在白名单")
+            return
+
+        # 最终结果由 runner 记录（extracted / noise / unparsed / degraded）
+        await process_raw(raw_id)
+
+    except Exception as exc:
+        # 兜底：任何未预期的异常也要留下这一条消息的记录，不能让它在日志里消失
+        log_message(meta, "error", 原因=f"{type(exc).__name__}: {exc}")
+        raise
 
 
 async def _try_group_name(group_id: str) -> str | None:

@@ -18,18 +18,14 @@ from . import __version__
 from .api import router
 from .config import get_settings
 from .db import close_db, init_db
+from .logging_setup import setup_logging
 from .onebot import get_hub
 from .pipeline.digest import digest_loop
 from .pipeline.ingest import close_http, handle_event
 from .pipeline.watchdog import silence_loop, startup_gap_check
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)-7s %(name)s | %(message)s",
-    datefmt="%H:%M:%S",
-)
-logging.getLogger("httpx").setLevel(logging.WARNING)
-logging.getLogger("LiteLLM").setLevel(logging.WARNING)
+_settings = get_settings()
+setup_logging()
 logger = logging.getLogger("xcollector")
 
 _tasks: list[asyncio.Task] = []
@@ -73,7 +69,6 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Xcollector", version=__version__, lifespan=lifespan)
 
-_settings = get_settings()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_settings.cors_origin_list,

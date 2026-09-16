@@ -17,6 +17,7 @@ from ..config import get_settings
 from ..db import bump_stat, get_raw, set_raw_state, upsert_notification
 from .extract import extract_with_llm
 from .rule_extract import rule_extract
+from .trace import describe_attachment_count, fmt_due, log_message
 
 logger = logging.getLogger(__name__)
 
@@ -109,11 +110,16 @@ async def process_raw(raw_id: str) -> None:
         await bump_stat("llm_tokens", tokens)
 
     if result is None:
-        reason = "模型判定为非通知" if not degraded else "LLM 失败且规则也无法解析"
-        await set_raw_state(raw_id, "unparsed", reason)
-        await bump_stat("unparsed")
         if degraded:
+            # LLM 失败、规则也没兜住 —— 这是真的盲区
+            await set_raw_state(raw_id, "degraded", "LLM 失败且规则也无法解析")
             await bump_stat("degraded")
+            await bump_stat("unparsed")
+            log_message(raw, "degraded", 原因="LLM 失败且规则也无法解析", 抽取器=settings.extractor)
+        else:
+            # 判定为闲聊/回执，属于正常结果，不该计入"未能解析"
+            await set_raw_state(raw_id, "noise", "判定为非通知")
+            log_message(raw, "noise", 抽取器=settings.extractor)
         return
 
     # 硬约束：evidence 必须非空。没有证据的条目宁可不要。
@@ -121,6 +127,12 @@ async def process_raw(raw_id: str) -> None:
     if not evidence:
         await set_raw_state(raw_id, "unparsed", "抽取结果缺少 evidence，已拒绝建条")
         await bump_stat("unparsed")
+        log_message(
+            raw,
+            "unparsed",
+            原因="抽取结果缺少 evidence，已拒绝建条",
+            抽取器=settings.extractor,
+        )
         return
 
     payload = {
@@ -147,3 +159,16 @@ async def process_raw(raw_id: str) -> None:
     await bump_stat("extracted")
     if degraded:
         await bump_stat("degraded")
+
+    log_message(
+        raw,
+        "extracted",
+        标题=payload["title"],
+        截止=fmt_due(payload["due_at"], payload["due_text"]),
+        置信度=payload["due_confidence"],
+        冲突="是" if payload["conflict"] else None,
+        抽取器=payload["extractor"],
+        模型=payload["model"],
+        tokens=tokens or None,
+        附件=describe_attachment_count(raw) or None,
+    )
