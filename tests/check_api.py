@@ -64,9 +64,9 @@ def message_body(message_id: str, ts: int, text: str = "正文：冒烟测试") 
     return {
         "message_id": message_id,
         "group_id": GROUP,
-        "group_name": "NOVA官方通知群",
+        "group_name": "示例通知群",
         "sender_id": "10001",
-        "sender_name": "李老师",
+        "sender_name": "张老师",
         "ts": ts,
         "content": text,
         "attachments": [],
@@ -85,9 +85,9 @@ def notification_body(
     return {
         "raw_message_id": raw_id,
         "group_id": GROUP,
-        "group_name": "NOVA官方通知群",
+        "group_name": "示例通知群",
         "sender_id": "10001",
-        "sender_name": "李老师",
+        "sender_name": "张老师",
         "source_ts": ts,
         "title": title,
         "summary": "摘要",
@@ -465,13 +465,13 @@ check("非 multipart → 400", r.status_code == 400, f"HTTP {r.status_code}")
 # ---------------------------------------------------------------------------
 print("\n--- groups / gap-alerts ---")
 t0 = now_ms()
-r = c.post(f"{API}/groups", json={"group_id": GROUP, "group_name": "NOVA官方通知群", "last_msg_ts": t0}, headers=H)
+r = c.post(f"{API}/groups", json={"group_id": GROUP, "group_name": "示例通知群", "last_msg_ts": t0}, headers=H)
 check("POST /groups 200", r.status_code == 200, r.text[:200])
 first = r.json()
 check("首次 upsert：previous_last_msg_ts=null", first.get("previous_last_msg_ts") is None, r.text[:200])
 check("响应带 group 行", set((first.get("group") or {})) >= {"group_id", "group_name", "last_msg_ts", "msg_count_today", "count_date"}, str(first))
 check("group.last_msg_ts 已写入", (first.get("group") or {}).get("last_msg_ts") == t0)
-r = c.post(f"{API}/groups", json={"group_id": GROUP, "group_name": "NOVA官方通知群", "last_msg_ts": t0 + 60_000}, headers=H)
+r = c.post(f"{API}/groups", json={"group_id": GROUP, "group_name": "示例通知群", "last_msg_ts": t0 + 60_000}, headers=H)
 second = r.json()
 check("二次 upsert：previous=上一条", second.get("previous_last_msg_ts") == t0, r.text[:200])
 check("二次 upsert：last_msg_ts 更新", (second.get("group") or {}).get("last_msg_ts") == t0 + 60_000)
@@ -484,7 +484,7 @@ check("GET /groups 含本群", any(g["group_id"] == GROUP for g in r.json().get(
 
 r = c.post(
     f"{API}/gap-alerts",
-    json={"group_id": GROUP, "group_name": "NOVA官方通知群", "from_ts": t0, "to_ts": t0 + 1000, "reason": f"间隔 16.7 小时 {RUN}"},
+    json={"group_id": GROUP, "group_name": "示例通知群", "from_ts": t0, "to_ts": t0 + 1000, "reason": f"间隔 16.7 小时 {RUN}"},
     headers=H,
 )
 check("POST /gap-alerts 200", r.status_code == 200, r.text[:160])

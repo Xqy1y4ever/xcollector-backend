@@ -44,10 +44,10 @@
 ```json
 {
   "message_id": "12345",
-  "group_id": "673504310",
-  "group_name": "NOVA官方通知群",
+  "group_id": "123456789",
+  "group_name": "示例通知群",
   "sender_id": "10001",
-  "sender_name": "李老师",
+  "sender_name": "张老师",
   "ts": 1757692800000,
   "content": "@全体成员 大家下周三前把军训心得交到班长那里",
   "attachments": [
@@ -100,10 +100,10 @@ Query：`state`（可重复或逗号分隔）、`group_id`、`since`（ts 毫秒
 ```json
 {
   "raw_message_id": "01J8XK2M9P",
-  "group_id": "673504310",
-  "group_name": "NOVA官方通知群",
+  "group_id": "123456789",
+  "group_name": "示例通知群",
   "sender_id": "10001",
-  "sender_name": "李老师",
+  "sender_name": "张老师",
   "source_ts": 1757692800000,
   "title": "提交军训心得",
   "summary": "全体大一需提交不少于 800 字",
@@ -227,14 +227,14 @@ bot 每收到一条消息就 upsert 一次。**缺口检测需要"上一条消�
 ### `POST /api/groups` — upsert
 
 ```json
-{"group_id": "673504310", "group_name": "NOVA官方通知群", "last_msg_ts": 1757692800000}
+{"group_id": "123456789", "group_name": "示例通知群", "last_msg_ts": 1757692800000}
 ```
 
 响应：
 
 ```json
 {
-  "group": {"group_id": "673504310", "group_name": "...", "last_msg_ts": 1757692800000, "msg_count_today": 12, "count_date": "2026-09-16"},
+  "group": {"group_id": "123456789", "group_name": "...", "last_msg_ts": 1757692800000, "msg_count_today": 12, "count_date": "2026-09-16"},
   "previous_last_msg_ts": 1757606400000
 }
 ```
@@ -250,7 +250,7 @@ bot 每收到一条消息就 upsert 一次。**缺口检测需要"上一条消�
 ### `POST /api/gap-alerts`
 
 ```json
-{"group_id": "673504310", "group_name": "...", "from_ts": 1757000000000, "to_ts": 1757060000000, "reason": "两条消息间隔 16.7 小时"}
+{"group_id": "123456789", "group_name": "...", "from_ts": 1757000000000, "to_ts": 1757060000000, "reason": "两条消息间隔 16.7 小时"}
 ```
 
 响应：`{"id": "gap_xxx"}`
@@ -343,8 +343,8 @@ bot 自己数，数完写进来。后端只做累加，不理解每个字段是�
     "vlm_enabled": false
   },
   "whitelist": {
-    "groups": [{"group_id": "673504310", "name": null}],
-    "senders": [{"sender_id": "10001", "name": "李老师"}],
+    "groups": [{"group_id": "123456789", "name": null}],
+    "senders": [{"sender_id": "10001", "name": "张老师"}],
     "sender_mode": "off"
   },
   "pipeline": {
@@ -363,16 +363,16 @@ bot 自己数，数完写进来。后端只做累加，不理解每个字段是�
     "window_days": 7
   },
   "groups": [
-    {"group_id": "673504310", "group_name": "NOVA官方通知群", "in_whitelist": true,
+    {"group_id": "123456789", "group_name": "示例通知群", "in_whitelist": true,
      "last_msg_ts": 1757692790000, "last_msg_at": 1757692790000,
      "silent_hours": 0.4, "msg_count_today": 12}
   ],
   "gap_alerts": [
-    {"id": "gap_xxx", "group_id": "673504310", "group_name": "...",
+    {"id": "gap_xxx", "group_id": "123456789", "group_name": "...",
      "from_ts": 1757000000000, "to_ts": 1757060000000, "reason": "...", "created_at": 1757060000000}
   ],
   "backend": {"reachable": true, "base_url": "http://127.0.0.1:8000"},
-  "digest": {"enabled": true, "time": "21:30", "target_qq": "242684313", "sent_today": false},
+  "digest": {"enabled": true, "time": "21:30", "target_qq": "10001", "sent_today": false},
   "day": "2026-09-16",
   "server_time": 1757692800000
 }
