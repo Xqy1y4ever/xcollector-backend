@@ -1,0 +1,18 @@
+# 构建镜像时排除的东西 —— 尤其是 data/：
+# 里面是真实的 SQLite 库和附件，绝不能烤进镜像
+.venv/
+__pycache__/
+*.py[cod]
+data/
+docs/
+.env
+.env.*
+!.env.example
+*.db
+*.db-wal
+*.db-shm
+*.log
+.git/
+.gitignore
+.gitattributes
+.pytest_cache/
