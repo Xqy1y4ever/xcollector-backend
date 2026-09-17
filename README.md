@@ -4,8 +4,12 @@ Xcollector 的**数据层**：把 QQ 群里收到的官方通知存下来，并�
 bot 写入、给网页读取。
 
 它不做任何业务判断 —— 「什么是通知」「截止时间对不对」由
-[`xcollector-bot`](../xcollector-bot/) 决定。后端只负责存、查、和把**人工修正过的
-视图**读回去。
+[`xcollector-bot`](https://github.com/Xqy1y4ever/xcollector-bot) 决定。后端只负责存、查、
+和把**人工修正过的视图**读回去。
+
+> **项目主页与部署入口在
+> [`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy)**
+> —— 想看这套系统整体怎么跑、怎么装，从那里开始。
 
 > 接口契约见 [`docs/api.md`](docs/api.md)，那是几个仓库之间唯一的约定。
 > 设计背景见 [`docs/design.md`](docs/design.md)。
@@ -46,10 +50,11 @@ QQ / NapCat ──OneBot──▶ xcollector-bot ──HTTP /api/*──▶ xcol
 ### Docker（推荐）
 
 镜像由 CI 构建推送到 GHCR，编排在
-[`xcollector-deploy`](../xcollector-deploy/) 仓库里：
+[`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy) 仓库里：
 
 ```bash
-cd ../xcollector-deploy
+git clone https://github.com/Xqy1y4ever/xcollector-deploy.git
+cd xcollector-deploy
 cp .env.example .env     # 填 API_TOKEN / WEB_API_TOKEN / 群白名单
 sh preflight.sh          # 预检：端口、配置、镜像
 docker compose up -d
@@ -70,7 +75,8 @@ python -m app.main
 # 交互式接口文档：http://127.0.0.1:8000/docs
 ```
 
-只跑后端不会有数据进来 —— 还需要另开一个终端跑 `../xcollector-bot`。
+只跑后端不会有数据进来 —— 还需要另开一个终端跑
+[`xcollector-bot`](https://github.com/Xqy1y4ever/xcollector-bot)。
 
 ## 配置
 
