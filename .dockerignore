@@ -13,6 +13,9 @@ docs/
 *.db-shm
 *.log
 .git/
+.github/
 .gitignore
 .gitattributes
+Dockerfile
+.dockerignore
 .pytest_cache/
