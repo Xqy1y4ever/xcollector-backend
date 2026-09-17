@@ -27,6 +27,7 @@ from fastapi import Request
 
 from .config import get_settings
 from .db import get_attachment, insert_attachment
+from .signing import attachment_path
 from .utils import new_id
 
 logger = logging.getLogger(__name__)
@@ -275,7 +276,11 @@ async def store_upload(
     )
     return {
         "id": att_id,
-        "url": f"/api/attachments/{att_id}",
+        # **裸路径**：这是规范引用，bot 会把它存进 raw_message.attachments。
+        # 真正对外提供的 URL 不在这里签 —— 签名会过期，存下来历史条目就打不开了。
+        # 读投影（materialize.to_view / raw_view）每次读取时现签，
+        # 见 signing.sign_attachments。
+        "url": attachment_path(att_id),
         "size": len(data),
         "content_type": resolved_type,
     }

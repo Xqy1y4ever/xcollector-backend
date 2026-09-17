@@ -13,8 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-import secrets
-from typing import Any
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
@@ -27,7 +26,9 @@ from ..attachments import (
     handle_upload,
     load_bytes,
 )
+from ..auth import Scope, optional_token, require_token, require_write
 from ..config import get_settings
+from ..signing import verify_attachment_sig
 from ..db import (
     NOTIFICATION_PATCHABLE,
     RAW_PATCHABLE,
@@ -81,46 +82,21 @@ VALID_STATUS = {"active", "archived", "done"}
 _TRUE = {"1", "true", "yes", "on", "t"}
 _FALSE = {"0", "false", "no", "off", "f", ""}
 
-_warned_open = False
-
-
 # --------------------------------------------------------------------------
-# 认证：所有 /api 请求都要带 Authorization: Bearer <API_TOKEN>
+# 认证：见 auth.py。所有 /api 请求都要带 Authorization: Bearer <令牌>，
+# 而**写接口**另外要求那是写入令牌（只有 bot 有）。
+#
+# 两个 router：
+#   router       要 Bearer（默认，绝大多数接口）
+#   open_router  不要 Bearer，自己判断"签名 URL 或 Bearer"—— 只放附件下载，
+#                因为浏览器 <img> / <a> 带不了 Authorization 头。
 # --------------------------------------------------------------------------
-
-
-async def require_token(authorization: str | None = Header(default=None)) -> None:
-    """校验共享密钥。
-
-    `API_TOKEN` 为空 = 不校验（仅本地开发），但会打 WARNING ——
-    "忘了配"和"故意不配"在日志里必须能区分开。
-    """
-    global _warned_open
-    settings = get_settings()
-    if not settings.auth_enabled:
-        if not _warned_open:
-            _warned_open = True
-            logger.warning(
-                "API_TOKEN 未配置：本服务不校验任何请求的 Authorization 头（仅限本地开发）"
-            )
-        return
-
-    scheme, _, token = (authorization or "").partition(" ")
-    if scheme.lower() != "bearer" or not token.strip():
-        raise HTTPException(
-            status_code=401,
-            detail="缺少 Authorization: Bearer <API_TOKEN>",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    if not secrets.compare_digest(token.strip(), settings.api_token.strip()):
-        raise HTTPException(
-            status_code=401,
-            detail="API_TOKEN 无效",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_token)])
+open_router = APIRouter(prefix="/api")
+
+# 写接口统一挂这个：网页令牌调会得到 403 而不是 401（身份有效但没权限）
+WriteDep = Depends(require_write)
 
 
 # --------------------------------------------------------------------------
@@ -189,7 +165,7 @@ class MessageBody(BaseModel):
     raw: Any = None
 
 
-@router.post("/messages")
+@router.post("/messages", dependencies=[WriteDep])
 async def create_message(body: MessageBody):
     """创建原始消息（幂等：`(group_id, message_id)` 唯一）。"""
     raw_id, is_new = await insert_raw_message(
@@ -244,7 +220,7 @@ class MessagePatch(BaseModel):
     attachments: Any = None
 
 
-@router.patch("/messages/{raw_id}")
+@router.patch("/messages/{raw_id}", dependencies=[WriteDep])
 async def patch_message(raw_id: str, body: MessagePatch):
     """只允许改 `state` / `state_reason` / `attachments`。
 
@@ -303,7 +279,7 @@ class NotificationBody(BaseModel):
     prompt_ver: str | None = None
 
 
-@router.post("/notifications")
+@router.post("/notifications", dependencies=[WriteDep])
 async def create_notification(body: NotificationBody):
     """创建或更新通知（幂等：`raw_message_id` 唯一）。
 
@@ -389,7 +365,7 @@ class NotificationPatch(BaseModel):
     prompt_ver: str | None = None
 
 
-@router.patch("/notifications/{notif_id}")
+@router.patch("/notifications/{notif_id}", dependencies=[WriteDep])
 async def patch_notification_route(notif_id: str, body: NotificationPatch):
     """bot 重跑时改机器字段。
 
@@ -432,7 +408,7 @@ async def patch_notification_route(notif_id: str, body: NotificationPatch):
     return await get_notification_view(notif_id)
 
 
-@router.delete("/notifications/{notif_id}")
+@router.delete("/notifications/{notif_id}", dependencies=[WriteDep])
 async def delete_notification_route(notif_id: str):
     if not await delete_notification(notif_id):
         raise HTTPException(status_code=404, detail="通知不存在")
@@ -505,7 +481,7 @@ async def mark_read(notif_id: str, body: ReadBody):
 # --------------------------------------------------------------------------
 
 
-@router.post("/attachments")
+@router.post("/attachments", dependencies=[WriteDep])
 async def upload_attachment(request: Request):
     """`multipart/form-data`：`file` / `filename` / `source_url`。"""
     try:
@@ -516,8 +492,39 @@ async def upload_attachment(request: Request):
         raise HTTPException(status_code=400, detail=str(exc))
 
 
-@router.get("/attachments/{att_id}")
-async def download_attachment(att_id: str):
+async def require_download(
+    att_id: str,
+    exp: Annotated[str | None, Query()] = None,
+    sig: Annotated[str | None, Query()] = None,
+    scope: Annotated[Scope | None, Depends(optional_token)] = None,
+) -> None:
+    """附件下载的鉴权：**有效签名 URL 或有效 Bearer 令牌**，任一即可。
+
+    这是全项目**唯一**允许不带 Authorization 头的接口，因为浏览器用
+    `<img src>` / `<a href>` 取附件时根本带不了那个头。签名由 signing.py 发，
+    读投影里每次现签、带过期时间。
+
+    三条放行路径：
+      1. 没配 API_TOKEN（本地开发）—— 与其它接口一致，不校验
+      2. 带了有效 Bearer（bot、curl 调试走这条）
+      3. `exp` + `sig` 签名有效且未过期
+    都不满足 → 401。
+    """
+    if not get_settings().auth_enabled:
+        return
+    if scope is not None:
+        return
+    if verify_attachment_sig(att_id, exp, sig):
+        return
+    raise HTTPException(
+        status_code=401,
+        detail="附件需要有效的 Authorization: Bearer <令牌>，或未过期的签名链接",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+
+
+@open_router.get("/attachments/{att_id}")
+async def download_attachment(att_id: str, _: None = Depends(require_download)):
     loaded = await load_bytes(att_id)
     if loaded is None:
         raise HTTPException(status_code=404, detail="附件不存在或文件已丢失")
@@ -548,7 +555,7 @@ class GroupBody(BaseModel):
     group_name: str | None = None
 
 
-@router.post("/groups")
+@router.post("/groups", dependencies=[WriteDep])
 async def upsert_group_route(body: GroupBody):
     """upsert 群状态。
 
@@ -578,7 +585,7 @@ class GapAlertBody(BaseModel):
     reason: str | None = None
 
 
-@router.post("/gap-alerts")
+@router.post("/gap-alerts", dependencies=[WriteDep])
 async def create_gap_alert(body: GapAlertBody):
     alert_id = await add_gap_alert(
         body.group_id, body.group_name, body.from_ts, body.to_ts, body.reason
@@ -597,7 +604,7 @@ async def get_gap_alerts(
     return {"alerts": [{**row, "acknowledged": bool(row.get("acknowledged"))} for row in rows]}
 
 
-@router.post("/gap-alerts/{alert_id}/ack")
+@router.post("/gap-alerts/{alert_id}/ack", dependencies=[WriteDep])
 async def ack_gap_alert_route(alert_id: str):
     if not await ack_gap_alert(alert_id):
         raise HTTPException(status_code=404, detail="缺口告警不存在")
@@ -616,7 +623,7 @@ class StatsBody(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
-@router.post("/stats")
+@router.post("/stats", dependencies=[WriteDep])
 async def create_stats(body: StatsBody):
     increments: dict[str, int] = {}
     for key, value in body.fields.items():
@@ -649,7 +656,7 @@ class DigestLogBody(BaseModel):
     error: str | None = None
 
 
-@router.post("/digest-log")
+@router.post("/digest-log", dependencies=[WriteDep])
 async def create_digest_log(body: DigestLogBody):
     """记录一次发送（幂等键 `(day, kind, sent)`，见 db.add_digest_log）。
 
@@ -689,7 +696,7 @@ class StateBody(BaseModel):
     ttl_seconds: int | None = None
 
 
-@router.put("/state/{namespace}/{key}")
+@router.put("/state/{namespace}/{key}", dependencies=[WriteDep])
 async def put_state_route(namespace: str, key: str, body: StateBody):
     expires_at = None
     if body.ttl_seconds is not None:
@@ -715,7 +722,7 @@ async def get_state_route(namespace: str, key: str):
     }
 
 
-@router.delete("/state/{namespace}/{key}")
+@router.delete("/state/{namespace}/{key}", dependencies=[WriteDep])
 async def delete_state_route(namespace: str, key: str):
     """删除是幂等的：键本来就不存在也返回成功（后置条件都成立）。"""
     await delete_state(namespace, key)

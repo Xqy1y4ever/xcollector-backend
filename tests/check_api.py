@@ -182,8 +182,19 @@ r = c.patch(
 check("PATCH /messages 200", r.status_code == 200, r.text[:200])
 row = r.json()
 check("state 已改", row.get("state") == BOT_STATE, str(row.get("state")))
-check("state_reason 已改", row.get("state_reason") == "bot 自己定义的原因", str(row.get("state_reason")))
-check("attachments 事后补齐", row.get("attachments") == [{"id": "att_demo", "type": "image", "url": "/api/attachments/att_demo"}], str(row.get("attachments")))
+check(
+    "state_reason 已改", row.get("state_reason") == "bot 自己定义的原因", str(row.get("state_reason"))
+)
+# 附件 url 现在是**读时现签**的（带 exp+sig），因为浏览器 <img> 带不了 Authorization 头。
+# 所以这里断言的形状是：id/type 原样保留，url 指向同一个附件且**确实带了签名**。
+_atts = row.get("attachments") or []
+check("attachments 事后补齐（1 个）", len(_atts) == 1, str(_atts))
+check("附件 id/type 原样保留", _atts and _atts[0].get("id") == "att_demo" and _atts[0].get("type") == "image", str(_atts))
+check(
+    "附件 url 已签名且指向同一附件",
+    bool(_atts) and "/api/attachments/att_demo" in str(_atts[0].get("url")) and "sig=" in str(_atts[0].get("url")),
+    str(_atts[0].get("url") if _atts else None),
+)
 check("content 传了也没被改", row.get("content") == "正文：冒烟测试", str(row.get("content"))[:60])
 check("ts 传了也没被改", row.get("ts") == ts1 + 5, str(row.get("ts")))
 check("message_id 传了也没被改", row.get("message_id") == f"m2-{RUN}", str(row.get("message_id")))

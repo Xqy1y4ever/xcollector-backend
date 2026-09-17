@@ -95,8 +95,14 @@ python -m app.main
 
 ### 关键约定（实现时守住的东西）
 
-- **认证**：所有 `/api` 请求带 `Authorization: Bearer <API_TOKEN>`；`API_TOKEN` 为空
-  则不校验（仅本地开发）并打 WARNING。整套系统**只有一个共享密钥**。
+- **认证**：所有 `/api` 请求带 `Authorization: Bearer <令牌>`；两个令牌都为空
+  则不校验（仅本地开发）并打 WARNING。**两个令牌，两个范围**：
+  `API_TOKEN` 是写入令牌（只有 bot 有），`WEB_API_TOKEN` 是网页令牌
+  （只能读 + 人工修正 + 标已读）。范围不够返回 **403**，令牌不对返回 **401**。
+  `WEB_API_TOKEN` 留空 = 退回单令牌模式（行为与拆分前一致，但没有分级）。
+  细节见 [`docs/api.md`](docs/api.md) 的「通用约定」。
+- **附件下载是唯一允许不带 Authorization 头的接口**：浏览器 `<img>` 带不了那个头，
+  所以读投影里的附件 `url` 是每次读取现签的短时效签名链接（见 `app/signing.py`）。
 - **幂等**：`POST /api/messages` 靠 `(group_id, message_id)`，`POST /api/notifications`
   靠 `raw_message_id`，`POST /api/digest-log` 靠 `(day, kind, sent)`；重复提交返回已有 id。
 - **证据硬约束**：`evidence` 为空 → 400「没有证据的条目不许入库」。后端替 bot 守住这条。
@@ -114,11 +120,14 @@ python -m app.main
 
 ## 配置（只剩这些）
 
-全部 9 项，见 [`.env.example`](.env.example)。
+全部 12 项，见 [`.env.example`](.env.example)。
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `API_TOKEN` | 空 | 唯一的共享密钥（bot 侧同名）。空 = 不校验，仅本地开发 |
+| `API_TOKEN` | 空 | **写入令牌**（bot 侧同名）。只有 bot 有，不要给浏览器。空 = 不校验，仅本地开发 |
+| `WEB_API_TOKEN` | 空 | **网页令牌**（bot 侧同名）。只能读 + 人工修正 + 标已读。留空 = 退回单令牌模式 |
+| `ATTACHMENT_URL_TTL` | `3600` | 附件签名 URL 有效期（秒）。0 = 不签名（`<img>` 会 401） |
+| `ATTACHMENT_SIGN_KEY` | 空 | 附件签名密钥。留空 = 从 `API_TOKEN` 派生 |
 | `DB_PATH` | `data/xcollector.db` | SQLite 路径 |
 | `ATTACHMENT_DIR` | `data/attachments` | 附件二进制目录 |
 | `MEDIA_MAX_BYTES` | `5242880` | 单个附件上限，超限 413 |

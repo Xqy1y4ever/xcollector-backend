@@ -25,9 +25,21 @@
 ## 通用约定
 
 - 前缀 `/api`
-- 认证：所有请求带 `Authorization: Bearer <API_TOKEN>`；`API_TOKEN` 为空则不校验（仅本地开发）
-  - **整套系统只有一个共享密钥**，两边都叫 `API_TOKEN`。后端不再主动调用 bot，
-    所以不再需要第二个令牌。
+- 认证：所有请求带 `Authorization: Bearer <令牌>`；两个令牌都为空则不校验（仅本地开发）
+- **两个令牌，两个范围**（实现见 `app/auth.py`）：
+
+  | 令牌 | 谁持有 | 能做什么 |
+  |---|---|---|
+  | `API_TOKEN` | 只有 bot | 全部（含入库、建条、改机器字段、删除、写 state/stats/digest-log） |
+  | `WEB_API_TOKEN` | 前端登录页 | 读 + `POST /notifications/{id}/corrections` + `POST /notifications/{id}/read` |
+
+  - 范围不够返回 **403**（身份有效但没权限），令牌缺失/错误返回 **401** —— 前端据此
+    区分"重新登录"和"你没这个权限"。
+  - `WEB_API_TOKEN` 留空 = **单令牌模式**：`API_TOKEN` 同时充当网页令牌
+    （拆分之前的行为，已有部署不受影响，但没有分级）。
+  - 为什么拆：`WEB_API_TOKEN` 必须交给登录页，任何能打开网页的人都能拿到它。
+    同一个值就意味着那个人能伪造入库、删通知。
+  - 两个名字在 backend 与 bot 两边**必须同名同值**（有自检脚本守这条）。
 - 时间戳一律**毫秒整数**（如 `1757692800000`）
 - 所有写接口**幂等**：重复提交不会产生重复行
 - 未知字段忽略，不报错
@@ -213,9 +225,37 @@ bot 重跑抽取时用。可改：`title` / `summary` / `location` / `due_at` / 
 {"id": "att_xxx", "url": "/api/attachments/att_xxx", "size": 12345, "content_type": "image/jpeg"}
 ```
 
+`url` 是**裸路径**（规范引用），bot 会把它存进 `raw_message.attachments`。
+真正对外提供的 URL **不在这里签** —— 签名会过期，存下来的话历史条目的图就打不开了。
+
 上限 `MEDIA_MAX_BYTES`（默认 5MB），超限返回 413。
 
 ### `GET /api/attachments/{id}` → 二进制，带正确的 `Content-Type` 与 `Content-Disposition`
+
+**这是全项目唯一允许不带 `Authorization` 头的接口。**
+
+浏览器用 `<img src>` / `<a href>` 取附件时根本带不了那个头，所以这里走
+**短时效签名 URL**：读投影（`GET /api/notifications*`、`GET /api/messages/{id}`）
+里的 `attachments[].url` 是**每次读取现签**的：
+
+```
+/api/attachments/att_xxx?exp=1789651540&sig=cbe1b514e6077d1c1490d90adab36d3f
+```
+
+`sig` = `HMAC-SHA256(派生自 API_TOKEN 的密钥, "<id>.<exp>")` 的前 32 个 hex 字符，
+所以**签名覆盖了 id**：把 A 的合法签名挪到 B 上会被拒绝。
+
+放行条件（任一满足即可）：
+
+1. 没配 `API_TOKEN`（本地开发，与其它接口一致地不校验）
+2. 带了有效 `Bearer`（bot、curl 调试走这条）
+3. `exp` 未过期 **且** `sig` 正确
+
+有效期 `ATTACHMENT_URL_TTL`（默认 3600 秒）。设为 `0` 则不签名，退回"必须带 Bearer"
+—— 那样 `<img>` 会 401。签名密钥可用 `ATTACHMENT_SIGN_KEY` 单独指定，留空则从
+`API_TOKEN` 派生。
+
+> 前端不需要为此做任何事：它本来就读 `attachment.url`，签名是后端在读取时加上的。
 
 ---
 

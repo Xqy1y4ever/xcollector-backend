@@ -28,9 +28,16 @@ class Settings(BaseSettings):
     )
 
     # ---------------- 认证 ----------------
-    # 整套系统只有这一个共享密钥：bot 调后端时带 `Authorization: Bearer <API_TOKEN>`。
+    # 写入令牌：bot 调后端时带 `Authorization: Bearer <API_TOKEN>`。
     # 留空 = 不校验（仅本地开发用），启动时会打一条 WARNING。
     api_token: str = ""
+
+    # 网页令牌：前端登录页用。只允许"读取 + 人工修正 + 标已读"，
+    # 入库/建条/改机器字段/删除一律被 403 挡住（见 auth.py）。
+    #
+    # 留空 = 退回单令牌模式：API_TOKEN 同时充当网页令牌 —— 也就是拆分之前的
+    # 行为。已有部署不改配置也能正常跑，但**那就没有分级**。
+    web_api_token: str = ""
 
     # ---------------- 存储 ----------------
     db_path: str = "data/xcollector.db"
@@ -38,6 +45,15 @@ class Settings(BaseSettings):
     attachment_dir: str = "data/attachments"
     # 单个附件的字节上限，超限上传返回 413
     media_max_bytes: int = 5 * 1024 * 1024
+
+    # ---------------- 附件签名 URL ----------------
+    # 有效期（秒）。浏览器用 <img> 取附件时带不了 Authorization 头，所以读投影
+    # 里的附件 url 是**现签**的，带 exp + HMAC（见 signing.py）。
+    # 0 = 不签名，退回"下载必须带 Bearer"（那样 <img> 会 401）。
+    attachment_url_ttl: int = 3600
+    # 签名密钥。留空 = 从 API_TOKEN 派生，通常不用单独配。
+    # 想单独轮换附件链接（不影响登录令牌）时才设它。
+    attachment_sign_key: str = ""
 
     # ---------------- HTTP ----------------
     server_host: str = "127.0.0.1"
@@ -69,6 +85,16 @@ class Settings(BaseSettings):
     def auth_enabled(self) -> bool:
         """是否真的在校验令牌。空令牌只对本地开发放行，不是"配置好了"。"""
         return bool(self.api_token.strip())
+
+    @property
+    def web_scope_separated(self) -> bool:
+        """网页令牌与写入令牌是否**真的**分开了。
+
+        配成同一个值等于没拆 —— 启动日志和自检脚本都要能看出这一点，
+        否则用户会以为已经收紧了，实际没有。
+        """
+        web = self.web_api_token.strip()
+        return bool(self.auth_enabled and web and web != self.api_token.strip())
 
 
 @lru_cache(maxsize=1)

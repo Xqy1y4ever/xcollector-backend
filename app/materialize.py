@@ -18,6 +18,7 @@ from __future__ import annotations
 from typing import Any, Sequence
 
 from .db import count_of, fetch_all, fetch_one
+from .signing import sign_attachments
 from .utils import json_loads, now_ms
 
 # 只追加的人工修正层里，允许出现的字段（契约 §2）
@@ -196,7 +197,7 @@ def to_view(row: dict) -> dict:
         "status": row.get("status"),
         "manually_edited": bool(row.get("correction_count")),
         "read": row.get("read_at") is not None,
-        "attachments": json_loads(row.get("raw_attachments"), []),
+        "attachments": sign_attachments(json_loads(row.get("raw_attachments"), [])),
         "extractor": row.get("extractor"),
         "model": row.get("model"),
         "prompt_ver": row.get("prompt_ver"),
@@ -248,7 +249,7 @@ def raw_view(row: dict | None) -> dict | None:
         "sender_name": row.get("sender_name"),
         "ts": row.get("ts"),
         "content": row.get("content") or "",
-        "attachments": json_loads(row.get("attachments"), []),
+        "attachments": sign_attachments(json_loads(row.get("attachments"), [])),
         "raw": json_loads(row.get("raw"), {}),
         "ingested_at": row.get("ingested_at"),
         "state": row.get("state"),
