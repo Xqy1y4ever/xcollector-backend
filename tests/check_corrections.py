@@ -7,6 +7,9 @@
 
 脚本自己在库里造一条自检数据（message_id 以 `selftest-` 开头），
 不依赖任何演示数据；跑完会把它连同修正一起删掉，不留在库里。
+
+多用户之后每个查询都要带 user_id —— 这个脚本用一个固定的自检用户
+（`SELFTEST_USER`），不依赖 app_user 表里真的有这行（通知表只存字符串 id）。
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ from app.utils import now_ms
 
 SELFTEST_MESSAGE_ID = "selftest-corrections"
 GROUP_ID = "selftest-group"
+# 自检数据挂在这个用户下 —— 用完连它一起删掉，不污染任何真实用户的数据
+SELFTEST_USER = "usr_selftest"
 
 
 def machine_payload(raw_id: str, *, title: str, due_at: int, prompt_ver: str) -> dict:
@@ -75,14 +80,18 @@ async def _run() -> int:
         attachments=[],
         raw={"selftest": True},
     )
-    # 先把上一次可能残留的修正与机器字段清干净，让结果可重复
-    await execute("DELETE FROM correction WHERE notification_id IN (SELECT id FROM notification WHERE raw_message_id=?)", (raw_id,))
+    # 先把上一次可能残留的修正清干净，让结果可重复
+    await execute(
+        "DELETE FROM correction WHERE user_id=? AND notification_id IN"
+        " (SELECT id FROM notification WHERE user_id=? AND raw_message_id=?)",
+        (SELFTEST_USER, SELFTEST_USER, raw_id),
+    )
     original = machine_payload(raw_id, title="机器标题 v1", due_at=machine_due, prompt_ver="v1")
-    notif_id, created = await upsert_notification(original)
+    notif_id, created = await upsert_notification(SELFTEST_USER, original)
     print(f"自检通知：{notif_id}（{'新建' if created else '复用'}）")
     print(f"机器值 due_at：{machine_due}")
 
-    before = await get_notification_view(notif_id)
+    before = await get_notification_view(SELFTEST_USER, notif_id)
     checks = [
         ("初始没有人工修正", before["manually_edited"] is False),
         ("初始用机器值", before["due_at"] == machine_due and before["title"] == "机器标题 v1"),
@@ -92,10 +101,10 @@ async def _run() -> int:
     human_due = machine_due + 7 * 24 * 3600 * 1000  # 人工改成往后一周
 
     # ---- 1. 人工修正立即生效 ----
-    await add_correction(notif_id, "due_at", human_due, user_id="selftest")
-    await add_correction(notif_id, "title", "（人工改过的标题）", user_id="selftest")
+    await add_correction(notif_id, SELFTEST_USER, "due_at", human_due, actor="selftest")
+    await add_correction(notif_id, SELFTEST_USER, "title", "（人工改过的标题）", actor="selftest")
 
-    view = await get_notification_view(notif_id)
+    view = await get_notification_view(SELFTEST_USER, notif_id)
     checks += [
         ("人工修正立即生效", view["due_at"] == human_due),
         ("manually_edited 标记为真", view["manually_edited"] is True),
@@ -104,30 +113,39 @@ async def _run() -> int:
 
     # ---- 2. 模拟重跑（覆盖 notification 表的机器字段，correction 表不动）----
     await upsert_notification(
-        machine_payload(raw_id, title="重跑后的机器标题", due_at=machine_due, prompt_ver="rerun")
+        SELFTEST_USER,
+        machine_payload(raw_id, title="重跑后的机器标题", due_at=machine_due, prompt_ver="rerun"),
     )
 
-    after = await get_notification_view(notif_id)
+    after = await get_notification_view(SELFTEST_USER, notif_id)
+    raw_row = await fetch_one(
+        "SELECT prompt_ver FROM notification WHERE id=? AND user_id=?",
+        (notif_id, SELFTEST_USER),
+    )
     checks += [
         ("重跑后人工时间仍在", after["due_at"] == human_due),
         ("重跑后人工标题仍在", after["title"] == "（人工改过的标题）"),
         ("重跑确实更新了机器字段", (after["prompt_ver"] or "") == "rerun"),
-        ("重跑后机器字段在库里的值也变了", (await fetch_one("SELECT prompt_ver FROM notification WHERE id=?", (notif_id,)))["prompt_ver"] == "rerun"),
+        ("重跑后机器字段在库里的值也变了", (raw_row or {})["prompt_ver"] == "rerun"),
     ]
 
     # ---- 3. status 同理：人工 status 优先于 due_at 推导 ----
-    await add_correction(notif_id, "status", "done", user_id="selftest")
-    view = await get_notification_view(notif_id)
+    await add_correction(notif_id, SELFTEST_USER, "status", "done", actor="selftest")
+    view = await get_notification_view(SELFTEST_USER, notif_id)
     checks += [
         ("人工 status 覆盖推导", view["status"] == "done"),
     ]
 
     # ---- 4. 清理：删掉自检修正、复原机器字段 ----
-    await execute("DELETE FROM correction WHERE notification_id=? AND user_id='selftest'", (notif_id,))
-    await upsert_notification(
-        machine_payload(raw_id, title="机器标题 v1", due_at=machine_due, prompt_ver="v1")
+    await execute(
+        "DELETE FROM correction WHERE notification_id=? AND user_id=?",
+        (notif_id, SELFTEST_USER),
     )
-    restored = await get_notification_view(notif_id)
+    await upsert_notification(
+        SELFTEST_USER,
+        machine_payload(raw_id, title="机器标题 v1", due_at=machine_due, prompt_ver="v1"),
+    )
+    restored = await get_notification_view(SELFTEST_USER, notif_id)
     checks += [
         ("清理后不再标记人工修正", restored["manually_edited"] is False),
         ("清理后回到机器值", restored["due_at"] == machine_due and restored["title"] == "机器标题 v1"),
@@ -136,12 +154,12 @@ async def _run() -> int:
 
     # ---- 5. 收尾：自检数据用完即删，不留在库里 ----
     # （删的是本脚本自己造的那一条，不是真的入库消息。）
-    await execute("DELETE FROM correction WHERE notification_id=?", (notif_id,))
-    await execute("DELETE FROM read_state WHERE notification_id=?", (notif_id,))
-    await execute("DELETE FROM notification WHERE id=?", (notif_id,))
+    await execute("DELETE FROM correction WHERE notification_id=? AND user_id=?", (notif_id, SELFTEST_USER))
+    await execute("DELETE FROM read_state WHERE notification_id=? AND user_id=?", (notif_id, SELFTEST_USER))
+    await execute("DELETE FROM notification WHERE id=? AND user_id=?", (notif_id, SELFTEST_USER))
     await execute("DELETE FROM raw_message WHERE id=?", (raw_id,))
     checks += [
-        ("自检数据已清理", await get_notification_view(notif_id) is None),
+        ("自检数据已清理", await get_notification_view(SELFTEST_USER, notif_id) is None),
     ]
 
     print()

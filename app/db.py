@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from typing import Any, Iterable, Sequence
 
 import aiosqlite
@@ -27,6 +28,97 @@ from .config import get_settings
 from .utils import local_day, new_id, now_ms
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# 需要**重建**（改主键 / 唯一约束）的三张表。
+#
+# SQLite 改不了主键和 UNIQUE，只能建新表搬数据。搬的时候必须用**和 SCHEMA 完全
+# 同一份**建表语句 —— 所以抽成常量，两边都引用它。抄第二份的下场是：某天给表
+# 加了一列，只改了 SCHEMA，老库重建出来的表少一列，而且不会有任何报错。
+#
+# `{table}` 是占位符：SCHEMA 里填真名，重建时填临时表名。
+# 索引不在常量里 —— 它们由 SCHEMA 负责，重建完再跑一遍 SCHEMA 就补回来了。
+# ---------------------------------------------------------------------------
+
+_CREATE_NOTIFICATION = """CREATE TABLE IF NOT EXISTS {table} (
+  id             TEXT PRIMARY KEY,
+  user_id        TEXT NOT NULL,
+  raw_message_id TEXT NOT NULL,
+  group_id       TEXT NOT NULL,
+  group_name     TEXT,
+  sender_id      TEXT,
+  sender_name    TEXT,
+  source_ts      INTEGER NOT NULL,
+  title          TEXT NOT NULL,
+  summary        TEXT,
+  location       TEXT,
+  due_at         INTEGER,
+  due_text       TEXT,
+  due_confidence REAL NOT NULL DEFAULT 0,
+  evidence       TEXT NOT NULL,
+  conflict       INTEGER NOT NULL DEFAULT 0,
+  candidates     TEXT NOT NULL DEFAULT '[]',
+  extractor      TEXT,
+  model          TEXT,
+  prompt_ver     TEXT,
+  created_at     INTEGER NOT NULL,
+  updated_at     INTEGER NOT NULL,
+  UNIQUE(user_id, raw_message_id)
+)"""
+
+_CREATE_PIPELINE_STAT = """CREATE TABLE IF NOT EXISTS {table} (
+  user_id       TEXT NOT NULL,
+  day           TEXT NOT NULL,
+  ingested      INTEGER NOT NULL DEFAULT 0,
+  extracted     INTEGER NOT NULL DEFAULT 0,
+  unparsed      INTEGER NOT NULL DEFAULT 0,
+  conflicts     INTEGER NOT NULL DEFAULT 0,
+  degraded      INTEGER NOT NULL DEFAULT 0,
+  llm_tokens    INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (user_id, day)
+)"""
+
+_CREATE_BOT_STATE = """CREATE TABLE IF NOT EXISTS {table} (
+  user_id    TEXT NOT NULL,
+  namespace  TEXT NOT NULL,
+  "key"      TEXT NOT NULL,
+  value      TEXT NOT NULL,
+  expires_at INTEGER,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, namespace, "key")
+)"""
+
+# (表名, 建表语句, 目标列顺序)。重建后 null 填充新增列。
+_REBUILDS: list[tuple[str, str, list[str]]] = [
+    (
+        "notification",
+        _CREATE_NOTIFICATION,
+        [
+            "id", "user_id", "raw_message_id", "group_id", "group_name",
+            "sender_id", "sender_name", "source_ts", "title", "summary",
+            "location", "due_at", "due_text", "due_confidence", "evidence",
+            "conflict", "candidates", "extractor", "model", "prompt_ver",
+            "created_at", "updated_at",
+        ],
+    ),
+    (
+        "pipeline_stat",
+        _CREATE_PIPELINE_STAT,
+        [
+            "user_id", "day", "ingested", "extracted", "unparsed",
+            "conflicts", "degraded", "llm_tokens",
+        ],
+    ),
+    (
+        "bot_state",
+        _CREATE_BOT_STATE,
+        [
+            "user_id", "namespace", "key", "value",
+            "expires_at", "created_at", "updated_at",
+        ],
+    ),
+]
 
 SCHEMA = """
 PRAGMA journal_mode=WAL;
@@ -57,48 +149,38 @@ CREATE INDEX IF NOT EXISTS ix_raw_group_ts ON raw_message(group_id, ts DESC);
 CREATE INDEX IF NOT EXISTS ix_raw_state    ON raw_message(state, ts DESC);
 
 -- ==================== 派生层：可整表重建 ====================
-CREATE TABLE IF NOT EXISTS notification (
-  id             TEXT PRIMARY KEY,
-  raw_message_id TEXT NOT NULL,
-  group_id       TEXT NOT NULL,
-  group_name     TEXT,
-  sender_id      TEXT,
-  sender_name    TEXT,
-  source_ts      INTEGER NOT NULL,
-  title          TEXT NOT NULL,
-  summary        TEXT,
-  location       TEXT,                     -- NULL = 原文没提（合法状态）
-  due_at         INTEGER,                  -- NULL = 没解析出确定时间（合法状态）
-  due_text       TEXT,
-  due_confidence REAL NOT NULL DEFAULT 0,
-  evidence       TEXT NOT NULL,            -- 支撑结论的原文片段，**必须非空**
-  conflict       INTEGER NOT NULL DEFAULT 0,
-  candidates     TEXT NOT NULL DEFAULT '[]',-- JSON 数组，原样透出
-  extractor      TEXT,                     -- 溯源字段，取值由 bot 定义
-  model          TEXT,
-  prompt_ver     TEXT,
-  created_at     INTEGER NOT NULL,
-  updated_at     INTEGER NOT NULL,
-  UNIQUE(raw_message_id)
-);
-CREATE INDEX IF NOT EXISTS ix_notif_due     ON notification(due_at);
+-- 多用户之后，通知是**按用户扇出**的：同一个 raw_message 被 N 个用户订阅，
+-- 就有 N 行 notification，每行各自带读/完成/修正状态。
+-- 所以唯一约束从 (raw_message_id) 变成 (user_id, raw_message_id)。
+""" + _CREATE_NOTIFICATION.format(table="notification") + """;
+CREATE INDEX IF NOT EXISTS ix_notif_owner   ON notification(user_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS ix_notif_due     ON notification(user_id, due_at);
 CREATE INDEX IF NOT EXISTS ix_notif_updated ON notification(updated_at DESC);
 CREATE INDEX IF NOT EXISTS ix_notif_group   ON notification(group_id, source_ts DESC);
 
 -- ==================== 人工修正：只追加 ====================
+-- 两个 user 字段含义不同，别混：
+--   user_id  租户 —— 这条修正属于谁的数据（隔离用）
+--   actor    谁操作的 —— 界面上显示"谁改的"（QQ 号 / "web"）
 CREATE TABLE IF NOT EXISTS correction (
   id              TEXT PRIMARY KEY,
+  user_id         TEXT NOT NULL,           -- 租户
   notification_id TEXT NOT NULL,
   field           TEXT NOT NULL,
   value           TEXT,                    -- 统一存字符串，读取时按字段类型还原
-  user_id         TEXT,
+  actor           TEXT,                    -- 操作者（旧列名叫 user_id，已改名）
   ts              INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS ix_corr_notif ON correction(notification_id, field, ts);
+CREATE INDEX IF NOT EXISTS ix_corr_owner ON correction(user_id, notification_id);
 
 -- ==================== 已读状态 ====================
+-- notification_id 本身已经是"某个用户的那一条"，所以主键不用变；
+-- user_id 是**冗余**出来的，作用只有一个：让"所有用户表都必须带 user_id"
+-- 这条自检规则没有例外（例外会被人当成"这里可以不带"）。
 CREATE TABLE IF NOT EXISTS read_state (
   notification_id TEXT PRIMARY KEY,
+  user_id         TEXT NOT NULL,
   read_at         INTEGER NOT NULL
 );
 
@@ -113,8 +195,10 @@ CREATE TABLE IF NOT EXISTS group_state (
 );
 
 -- ==================== 缺口告警 ====================
+-- 按用户扇出：用户只该看到自己订阅的群的缺口，否则是信息泄露。
 CREATE TABLE IF NOT EXISTS gap_alert (
   id           TEXT PRIMARY KEY,
+  user_id      TEXT NOT NULL,
   group_id     TEXT NOT NULL,
   group_name   TEXT,
   from_ts      INTEGER NOT NULL,
@@ -123,18 +207,11 @@ CREATE TABLE IF NOT EXISTS gap_alert (
   created_at   INTEGER NOT NULL,
   acknowledged INTEGER NOT NULL DEFAULT 0
 );
-CREATE INDEX IF NOT EXISTS ix_gap_created ON gap_alert(created_at DESC);
+CREATE INDEX IF NOT EXISTS ix_gap_created ON gap_alert(user_id, created_at DESC);
 
 -- ==================== 统计计数（bot 自己数，后端只做累加）====================
-CREATE TABLE IF NOT EXISTS pipeline_stat (
-  day           TEXT PRIMARY KEY,
-  ingested      INTEGER NOT NULL DEFAULT 0,
-  extracted     INTEGER NOT NULL DEFAULT 0,
-  unparsed      INTEGER NOT NULL DEFAULT 0,
-  conflicts     INTEGER NOT NULL DEFAULT 0,
-  degraded      INTEGER NOT NULL DEFAULT 0,
-  llm_tokens    INTEGER NOT NULL DEFAULT 0
-);
+-- 按用户分开统计：状态页给用户看的是"你的流水线"，不是全站。
+""" + _CREATE_PIPELINE_STAT.format(table="pipeline_stat") + """;
 
 -- ==================== 附件元数据（二进制在 ATTACHMENT_DIR）====================
 CREATE TABLE IF NOT EXISTS attachment (
@@ -151,6 +228,7 @@ CREATE INDEX IF NOT EXISTS ix_att_created ON attachment(created_at DESC);
 -- ==================== digest 发送记录（契约 §10）====================
 CREATE TABLE IF NOT EXISTS digest_log (
   id      TEXT PRIMARY KEY,
+  user_id TEXT NOT NULL,                   -- 发给谁的那一份
   day     TEXT NOT NULL,
   kind    TEXT NOT NULL,                   -- 取值由 bot 定义，后端不校验
   text    TEXT NOT NULL DEFAULT '',
@@ -158,18 +236,12 @@ CREATE TABLE IF NOT EXISTS digest_log (
   error   TEXT,
   ts      INTEGER NOT NULL
 );
-CREATE INDEX IF NOT EXISTS ix_digest_day ON digest_log(day, kind, ts DESC);
+CREATE INDEX IF NOT EXISTS ix_digest_day ON digest_log(user_id, day, kind, ts DESC);
 
 -- ==================== bot 的键值暂存（契约 §11）====================
-CREATE TABLE IF NOT EXISTS bot_state (
-  namespace  TEXT NOT NULL,
-  "key"      TEXT NOT NULL,
-  value      TEXT NOT NULL,                -- 任意 JSON，后端不理解含义
-  expires_at INTEGER,                      -- NULL = 不过期（毫秒）
-  created_at INTEGER NOT NULL,
-  updated_at INTEGER NOT NULL,
-  PRIMARY KEY (namespace, "key")
-);
+-- 「这个用户还挂着什么没做完」必须按用户分开：两个用户同时 /add 待确认，
+-- 不能互相覆盖。
+""" + _CREATE_BOT_STATE.format(table="bot_state") + """;
 CREATE INDEX IF NOT EXISTS ix_state_expires ON bot_state(expires_at);
 
 -- ==================== 用户与注册 ====================
@@ -209,6 +281,31 @@ CREATE TABLE IF NOT EXISTS qq_verify_code (
   attempts   INTEGER NOT NULL DEFAULT 0,     -- 猜错次数，超上限直接作废
   created_at INTEGER NOT NULL
 );
+-- ==================== 用户的订阅（契约 §12）====================
+-- 一个用户订的是「**谁**在**哪个群**说的话」，不是「哪个群」。
+--
+-- 为什么最小单位是 (群, 发送者) 而不是群：这条流水线里进清单的东西是**人**发的，
+-- 不是群发的。允许订"整个群"就等于允许"这个群里任何人说话都进我的清单" ——
+-- 那正是要避免的噪声，而且一旦有人这么订了，LLM 的调用量和误报都会失控。
+-- 所以 sender_id 在库层面 NOT NULL，写入路径也拒绝空值和通配符（见 subscriptions.py）。
+--
+-- 订阅定义的是"**抽什么**"；bot 的群白名单定义的是"**看得到什么**"。两者都要满足。
+CREATE TABLE IF NOT EXISTS subscription (
+  id          TEXT PRIMARY KEY,
+  user_id     TEXT NOT NULL,
+  group_id    TEXT NOT NULL,
+  sender_id   TEXT NOT NULL,               -- 必填，刻意不给"整个群"留口子
+  group_name  TEXT,                        -- 冗余存名字，只是为了列表好看
+  sender_name TEXT,
+  note        TEXT,                        -- 用户自己的备注
+  enabled     INTEGER NOT NULL DEFAULT 1,  -- 关掉但留着，比删了再重建友好
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  UNIQUE (user_id, group_id, sender_id)
+);
+CREATE INDEX IF NOT EXISTS ix_sub_owner ON subscription(user_id, enabled, updated_at DESC);
+-- 给 bot 的路由查询用：来了一条 (群, 发送者) 的消息，谁要？
+CREATE INDEX IF NOT EXISTS ix_sub_route ON subscription(group_id, sender_id, enabled);
 """
 
 _conn: aiosqlite.Connection | None = None
@@ -220,25 +317,105 @@ _write_lock = asyncio.Lock()
 # 老通知的地点就是空的，需要人工补或重跑。
 #
 # 新增**表**不在这里登记：SCHEMA 里的 CREATE TABLE IF NOT EXISTS 每次启动都会执行，
-# 老库会自动补出新表（attachment / digest_log / bot_state 都是这么加上去的）。
-# 这里登记的是"老库已经有这张表、只是缺这一列"的情况；新表也顺手登记一遍，
-# 保证万一日后给这张表加列时兼容路径已经在了。
+# 老库会自动补出新表。这里登记的是"老库已经有这张表、只是缺这一列"的情况。
 _MIGRATIONS: list[tuple[str, str, str]] = [
     ("notification", "location", "TEXT"),
     ("attachment", "source_url", "TEXT"),
     ("digest_log", "error", "TEXT"),
     ("bot_state", "expires_at", "INTEGER"),
+    # ---- 多用户改造（Phase 2）：按用户隔离 ----
+    ("correction", "user_id", "TEXT"),
+    ("read_state", "user_id", "TEXT"),
+    ("gap_alert", "user_id", "TEXT"),
+    ("digest_log", "user_id", "TEXT"),
+]
+
+# 列改名：(表, 旧名, 新名)
+#
+# correction 原来就用 `user_id` 表示"谁做的修正"（QQ 号 / "web"）。现在
+# `user_id` 必须留给**租户**，所以旧的那个改名叫 `actor`。
+# ⚠️ 顺序要紧：必须**先改名再新增** user_id，否则新列加不进来（同名冲突）。
+# 判据用"新名在不在"而不是"旧名在不在"：新库建出来就是 actor，重跑不会误改。
+_RENAMES: list[tuple[str, str, str]] = [
+    ("correction", "user_id", "actor"),
 ]
 
 
+async def _table_columns(table: str) -> set[str]:
+    async with db().execute(f"PRAGMA table_info({table})") as cur:
+        return {row["name"] for row in await cur.fetchall()}
+
+
+async def _table_exists(table: str) -> bool:
+    row = await fetch_one(
+        "SELECT 1 AS ok FROM sqlite_master WHERE type='table' AND name = ?", (table,)
+    )
+    return row is not None
+
+
+async def _rebuild_table(table: str, create_sql: str, target: list[str]) -> None:
+    """换掉表结构（改主键 / 唯一约束只能这么干）。
+
+    旧表里没有的列填 NULL —— 多用户改造加进来的 `user_id` 因此是 NULL，
+    也就是**老数据不属于任何用户、对谁都不可见**。这是刻意的：把无主数据
+    随便分给某个人，比让它看不见危险得多。
+    """
+    tmp = f"{table}__migrate"
+    existing = await _table_columns(table)
+
+    await db().executescript(f"DROP TABLE IF EXISTS {tmp};")
+    await db().executescript(create_sql.format(table=tmp))
+
+    cols = ", ".join(f'"{c}"' for c in target)
+    select = ", ".join(f'"{c}"' if c in existing else "NULL" for c in target)
+    await db().execute(f'INSERT INTO "{tmp}" ({cols}) SELECT {select} FROM "{table}"')
+    moved = await count_of(f'SELECT COUNT(*) AS n FROM "{tmp}"')
+
+    await db().execute(f'DROP TABLE "{table}"')
+    await db().execute(f'ALTER TABLE "{tmp}" RENAME TO "{table}"')
+    logger.info(
+        "数据库迁移：重建表 %s（%d 行），新增列 %s",
+        table,
+        moved,
+        [c for c in target if c not in existing],
+    )
+
+
 async def _migrate() -> None:
+    rebuilt = False
+
+    for table, old, new in _RENAMES:
+        if not await _table_exists(table):
+            continue
+        cols = await _table_columns(table)
+        if new not in cols and old in cols:
+            await db().execute(f'ALTER TABLE "{table}" RENAME COLUMN "{old}" TO "{new}"')
+            logger.info("数据库迁移：%s 列 %s 改名为 %s", table, old, new)
+
     for table, column, decl in _MIGRATIONS:
-        async with db().execute(f"PRAGMA table_info({table})") as cur:
-            existing = {row["name"] for row in await cur.fetchall()}
-        if column not in existing:
-            await db().execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        if not await _table_exists(table):
+            continue
+        if column not in await _table_columns(table):
+            await db().execute(f'ALTER TABLE "{table}" ADD COLUMN "{column}" {decl}')
             logger.info("数据库迁移：%s 新增列 %s", table, column)
+
+    # 重建必须放在加列**之后**：重建时要按目标列名去旧表里取值，
+    # 先把能加的列加上，能保留的数据才最多。
+    for table, create_sql, target in _REBUILDS:
+        if not await _table_exists(table):
+            continue
+        if "user_id" in await _table_columns(table):
+            continue  # 已经是新结构
+        await _rebuild_table(table, create_sql, target)
+        rebuilt = True
+
     await db().commit()
+
+    if rebuilt:
+        # 重建时旧表被 DROP，挂在它上面的索引一起没了。再跑一遍 SCHEMA 补回来
+        # （CREATE TABLE / INDEX IF NOT EXISTS 对已存在的都是空操作）。
+        await db().executescript(SCHEMA)
+        await db().commit()
 
 
 async def init_db() -> aiosqlite.Connection:
@@ -269,17 +446,65 @@ def db() -> aiosqlite.Connection:
 
 
 # --------------------------------------------------------------------------
+# 按用户隔离的表 + 运行时护栏
+#
+# 多用户服务最严重的 bug 不是崩溃，是**串数据**：用户 A 看到用户 B 的通知。
+# 靠"写代码时小心"守不住 —— 30 多个查询，漏一个就是泄漏，而且不会有任何报错。
+#
+# 所以这里做一道运行时检查：任何 SQL 只要碰了下面这些表，就必须出现 `user_id`，
+# 否则直接抛异常。**所有环境都开着**，不是只在测试里 —— 一个关掉的护栏等于没有。
+#
+# 不算"用户表"的：raw_message（所有人共享的并集）、attachment（字节只存一份，
+# 访问权由它所属的通知决定）、group_state（群级事实）、app_user 等注册相关表
+# （它们本来就是按 qq / id 定位的）。
+# --------------------------------------------------------------------------
+
+USER_SCOPED_TABLES = frozenset(
+    {
+        "notification",
+        "correction",
+        "read_state",
+        "gap_alert",
+        "pipeline_stat",
+        "digest_log",
+        "bot_state",
+        "subscription",
+    }
+)
+
+# 只看 FROM / INTO / UPDATE / JOIN 后面的那个词 —— 这样 `notification_id`
+# 这类列名不会被误判成表名。
+_SQL_TABLE_RE = re.compile(r"\b(?:FROM|INTO|UPDATE|JOIN)\s+\"?(\w+)\"?", re.IGNORECASE)
+
+
+class UnscopedQueryError(RuntimeError):
+    """碰了用户表，却没有按 user_id 过滤。"""
+
+
+def assert_scoped(sql: str) -> None:
+    touched = {m.group(1).lower() for m in _SQL_TABLE_RE.finditer(sql)}
+    leaked = touched & USER_SCOPED_TABLES
+    if leaked and "user_id" not in sql.lower():
+        raise UnscopedQueryError(
+            f"查询碰了用户表 {sorted(leaked)} 却没有 user_id 条件 —— "
+            f"这会让用户看到别人的数据：\n{sql.strip()[:300]}"
+        )
+
+
+# --------------------------------------------------------------------------
 # 通用查询
 # --------------------------------------------------------------------------
 
 
 async def fetch_all(sql: str, params: Sequence[Any] = ()) -> list[dict]:
+    assert_scoped(sql)
     async with db().execute(sql, params) as cur:
         rows = await cur.fetchall()
     return [dict(r) for r in rows]
 
 
 async def fetch_one(sql: str, params: Sequence[Any] = ()) -> dict | None:
+    assert_scoped(sql)
     async with db().execute(sql, params) as cur:
         row = await cur.fetchone()
     return dict(row) if row else None
@@ -287,10 +512,35 @@ async def fetch_one(sql: str, params: Sequence[Any] = ()) -> dict | None:
 
 async def execute(sql: str, params: Sequence[Any] = ()) -> int:
     """执行写操作，返回受影响行数。写操作串行化以避免 SQLite 锁冲突。"""
+    assert_scoped(sql)
+    return await _execute_unscoped(sql, params)
+
+
+async def _execute_unscoped(sql: str, params: Sequence[Any] = ()) -> int:
+    """**绕过护栏**的写操作。只给明确知道自己在干什么的地方用（目前只有全局过期清理）。
+
+    单独立一个函数而不是加个开关参数：绕过得在代码里看得见，
+    这样 review 的时候一眼能数出有几处、为什么。
+    """
     async with _write_lock:
         cur = await db().execute(sql, params)
         await db().commit()
         return cur.rowcount
+
+
+async def _fetch_all_unscoped(sql: str, params: Sequence[Any] = ()) -> list[dict]:
+    """**绕过护栏**的读操作。目前只有一处：bot 的路由查询 `find_subscribers`。
+
+    为什么它必须绕过：来了一条 (群, 发送者) 的消息，要问的是"**所有**用户里
+    谁订了这个来源" —— 这条查询按定义就不带 user_id，但它返回的是**投递名单**，
+    不是任何人的数据。真正要防的"用户看到别人的数据"在这里不成立：
+    调用方是服务令牌（bot），而且返回的 user_id 会立刻被用来各自的扇出。
+
+    除了这里，任何跨用户读都必须走带 user_id 的路径。
+    """
+    async with db().execute(sql, params) as cur:
+        rows = await cur.fetchall()
+    return [dict(r) for r in rows]
 
 
 async def count_of(sql: str, params: Sequence[Any] = ()) -> int:
@@ -474,14 +724,18 @@ def _notification_machine_values(data: dict) -> tuple:
     )
 
 
-async def upsert_notification(data: dict) -> tuple[str, bool]:
-    """按 `raw_message_id` 幂等写入通知。返回 (notif_id, 是否新建)。
+async def upsert_notification(user_id: str, data: dict) -> tuple[str, bool]:
+    """按 `(user_id, raw_message_id)` 幂等写入通知。返回 (notif_id, 是否新建)。
 
     已存在时只覆盖**机器字段**，correction 表不动 —— 于是"重跑抽取"
     永远不会冲掉人工修正（tests/check_corrections.py 守的就是这条）。
+
+    同一个 raw_message 会被扇出成 N 行（每个订阅它的用户一行），
+    所以幂等键必须带上 user_id。
     """
     existing = await fetch_one(
-        "SELECT id FROM notification WHERE raw_message_id=?", (data["raw_message_id"],)
+        "SELECT id FROM notification WHERE user_id=? AND raw_message_id=?",
+        (user_id, data["raw_message_id"]),
     )
     values = _notification_machine_values(data)
     if existing:
@@ -490,8 +744,8 @@ async def upsert_notification(data: dict) -> tuple[str, bool]:
                  title=?, summary=?, location=?, due_at=?, due_text=?, due_confidence=?,
                  evidence=?, conflict=?, candidates=?, extractor=?, model=?,
                  prompt_ver=?, updated_at=?
-               WHERE id=?""",
-            (*values, now_ms(), existing["id"]),
+               WHERE id=? AND user_id=?""",
+            (*values, now_ms(), existing["id"], user_id),
         )
         return existing["id"], False
 
@@ -499,12 +753,13 @@ async def upsert_notification(data: dict) -> tuple[str, bool]:
     ts = now_ms()
     await execute(
         """INSERT INTO notification
-           (id, raw_message_id, group_id, group_name, sender_id, sender_name, source_ts,
-            title, summary, location, due_at, due_text, due_confidence, evidence, conflict,
-            candidates, extractor, model, prompt_ver, created_at, updated_at)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           (id, user_id, raw_message_id, group_id, group_name, sender_id, sender_name,
+            source_ts, title, summary, location, due_at, due_text, due_confidence, evidence,
+            conflict, candidates, extractor, model, prompt_ver, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (
             notif_id,
+            user_id,
             data["raw_message_id"],
             str(data["group_id"]),
             data.get("group_name"),
@@ -519,41 +774,53 @@ async def upsert_notification(data: dict) -> tuple[str, bool]:
     return notif_id, True
 
 
-async def get_notification_row(notif_id: str) -> dict | None:
-    return await fetch_one("SELECT * FROM notification WHERE id=?", (notif_id,))
+async def get_notification_row(notif_id: str, user_id: str) -> dict | None:
+    return await fetch_one(
+        "SELECT * FROM notification WHERE id=? AND user_id=?", (notif_id, user_id)
+    )
 
 
-async def patch_notification(notif_id: str, fields: dict[str, Any]) -> bool:
+async def patch_notification(notif_id: str, user_id: str, fields: dict[str, Any]) -> bool:
     """改机器字段。`fields` 的键必须来自 NOTIFICATION_PATCHABLE（列名白名单）。"""
     unknown = [k for k in fields if k not in NOTIFICATION_PATCHABLE]
     if unknown:
         raise ValueError(f"不可修改的字段：{unknown}")
     if not fields:
-        return await get_notification_row(notif_id) is not None
+        return await get_notification_row(notif_id, user_id) is not None
     sets = ", ".join(f"{k}=?" for k in fields)
     rowcount = await execute(
-        f"UPDATE notification SET {sets}, updated_at=? WHERE id=?",
-        (*fields.values(), now_ms(), notif_id),
+        f"UPDATE notification SET {sets}, updated_at=? WHERE id=? AND user_id=?",
+        (*fields.values(), now_ms(), notif_id, user_id),
     )
     return rowcount > 0
 
 
-async def touch_notification(notif_id: str) -> None:
+async def touch_notification(notif_id: str, user_id: str) -> None:
     """把 updated_at 推到当前时间。
 
     人工修正与已读都会改变读投影，`since` 是"有没有变过"的游标，
     所以它们也要推一下 —— 否则前端增量同步会漏掉这些变化。
     """
-    await execute("UPDATE notification SET updated_at=? WHERE id=?", (now_ms(), notif_id))
+    await execute(
+        "UPDATE notification SET updated_at=? WHERE id=? AND user_id=?",
+        (now_ms(), notif_id, user_id),
+    )
 
 
-async def delete_notification(notif_id: str) -> bool:
+async def delete_notification(notif_id: str, user_id: str) -> bool:
     """删除通知行。correction / read_state 保留（只追加层不做级联删除）。"""
-    return await execute("DELETE FROM notification WHERE id=?", (notif_id,)) > 0
+    return (
+        await execute(
+            "DELETE FROM notification WHERE id=? AND user_id=?", (notif_id, user_id)
+        )
+        > 0
+    )
 
 
-async def count_notifications() -> int:
-    return await count_of("SELECT COUNT(*) AS c FROM notification")
+async def count_notifications(user_id: str) -> int:
+    return await count_of(
+        "SELECT COUNT(*) AS c FROM notification WHERE user_id=?", (user_id,)
+    )
 
 
 # --------------------------------------------------------------------------
@@ -562,36 +829,53 @@ async def count_notifications() -> int:
 
 
 async def add_correction(
-    notif_id: str, field: str, value: Any, user_id: str = "web"
+    notif_id: str, user_id: str, field: str, value: Any, actor: str = "web"
 ) -> str:
+    """追加一条人工修正。
+
+    `user_id` 是**租户**（这条数据属于谁），`actor` 是**操作者**
+    （界面上显示"谁改的"）。两个都要传，别混。
+    """
     corr_id = new_id()
     await execute(
-        """INSERT INTO correction (id, notification_id, field, value, user_id, ts)
-           VALUES (?,?,?,?,?,?)""",
-        (corr_id, notif_id, field, None if value is None else str(value), user_id, now_ms()),
+        """INSERT INTO correction (id, user_id, notification_id, field, value, actor, ts)
+           VALUES (?,?,?,?,?,?,?)""",
+        (
+            corr_id,
+            user_id,
+            notif_id,
+            field,
+            None if value is None else str(value),
+            actor,
+            now_ms(),
+        ),
     )
-    await touch_notification(notif_id)
+    await touch_notification(notif_id, user_id)
     return corr_id
 
 
-async def list_corrections(notif_id: str) -> list[dict]:
+async def list_corrections(notif_id: str, user_id: str) -> list[dict]:
     """修正历史，按时间正序（契约 §2）。"""
     return await fetch_all(
-        """SELECT id, notification_id, field, value, user_id, ts FROM correction
-           WHERE notification_id=? ORDER BY ts ASC, id ASC""",
-        (notif_id,),
+        """SELECT id, notification_id, field, value, actor, ts FROM correction
+           WHERE notification_id=? AND user_id=? ORDER BY ts ASC, id ASC""",
+        (notif_id, user_id),
     )
 
 
-async def set_read(notif_id: str, read: bool) -> None:
+async def set_read(notif_id: str, user_id: str, read: bool) -> None:
     if read:
         await execute(
-            "INSERT OR REPLACE INTO read_state (notification_id, read_at) VALUES (?,?)",
-            (notif_id, now_ms()),
+            "INSERT OR REPLACE INTO read_state (notification_id, user_id, read_at)"
+            " VALUES (?,?,?)",
+            (notif_id, user_id, now_ms()),
         )
     else:
-        await execute("DELETE FROM read_state WHERE notification_id=?", (notif_id,))
-    await touch_notification(notif_id)
+        await execute(
+            "DELETE FROM read_state WHERE notification_id=? AND user_id=?",
+            (notif_id, user_id),
+        )
+    await touch_notification(notif_id, user_id)
 
 
 # --------------------------------------------------------------------------
@@ -652,6 +936,7 @@ async def list_groups() -> list[dict]:
 
 
 async def add_gap_alert(
+    user_id: str,
     group_id: str,
     group_name: str | None,
     from_ts: int,
@@ -661,20 +946,29 @@ async def add_gap_alert(
     alert_id = new_id("gap_")
     await execute(
         """INSERT INTO gap_alert
-           (id, group_id, group_name, from_ts, to_ts, reason, created_at, acknowledged)
-           VALUES (?,?,?,?,?,?,?,0)""",
-        (alert_id, str(group_id), group_name, int(from_ts), int(to_ts), reason, now_ms()),
+           (id, user_id, group_id, group_name, from_ts, to_ts, reason, created_at, acknowledged)
+           VALUES (?,?,?,?,?,?,?,?,0)""",
+        (
+            alert_id,
+            user_id,
+            str(group_id),
+            group_name,
+            int(from_ts),
+            int(to_ts),
+            reason,
+            now_ms(),
+        ),
     )
     return alert_id
 
 
 async def list_gap_alerts(
-    *, acknowledged: bool | None = None, limit: int = 20
+    user_id: str, *, acknowledged: bool | None = None, limit: int = 20
 ) -> list[dict]:
-    where = ""
-    params: list[Any] = []
+    where = " WHERE user_id=?"
+    params: list[Any] = [user_id]
     if acknowledged is not None:
-        where = " WHERE acknowledged=?"
+        where += " AND acknowledged=?"
         params.append(1 if acknowledged else 0)
     return await fetch_all(
         f"SELECT * FROM gap_alert{where} ORDER BY created_at DESC LIMIT ?",
@@ -682,9 +976,13 @@ async def list_gap_alerts(
     )
 
 
-async def ack_gap_alert(alert_id: str) -> bool:
+async def ack_gap_alert(alert_id: str, user_id: str) -> bool:
     return (
-        await execute("UPDATE gap_alert SET acknowledged=1 WHERE id=?", (alert_id,)) > 0
+        await execute(
+            "UPDATE gap_alert SET acknowledged=1 WHERE id=? AND user_id=?",
+            (alert_id, user_id),
+        )
+        > 0
     )
 
 
@@ -695,25 +993,30 @@ async def ack_gap_alert(alert_id: str) -> bool:
 STAT_FIELDS = ("ingested", "extracted", "unparsed", "conflicts", "degraded", "llm_tokens")
 
 
-async def add_stats(day: str | None, fields: dict[str, int]) -> dict:
-    """把 `fields` 里的计数累加到 `day` 那一行，返回累加后的整行。
+async def add_stats(user_id: str, day: str | None, fields: dict[str, int]) -> dict:
+    """把 `fields` 里的计数累加到 `(user_id, day)` 那一行，返回累加后的整行。
 
     字段含义后端一概不理解：来的是已知列就加，未知键忽略（契约：未知字段忽略）。
     """
     d = (day or "").strip() or local_day()
     increments = {k: int(v) for k, v in fields.items() if k in STAT_FIELDS}
-    await execute("INSERT OR IGNORE INTO pipeline_stat (day) VALUES (?)", (d,))
+    await execute(
+        "INSERT OR IGNORE INTO pipeline_stat (user_id, day) VALUES (?,?)", (user_id, d)
+    )
     if increments:
         sets = ", ".join(f"{k} = {k} + ?" for k in increments)
         await execute(
-            f"UPDATE pipeline_stat SET {sets} WHERE day=?", (*increments.values(), d)
+            f"UPDATE pipeline_stat SET {sets} WHERE user_id=? AND day=?",
+            (*increments.values(), user_id, d),
         )
-    return await get_stat(d)
+    return await get_stat(user_id, d)
 
 
-async def get_stat(day: str | None = None) -> dict:
+async def get_stat(user_id: str, day: str | None = None) -> dict:
     d = (day or "").strip() or local_day()
-    row = await fetch_one("SELECT * FROM pipeline_stat WHERE day=?", (d,))
+    row = await fetch_one(
+        "SELECT * FROM pipeline_stat WHERE user_id=? AND day=?", (user_id, d)
+    )
     return {"day": d, **{f: int((row or {}).get(f) or 0) for f in STAT_FIELDS}}
 
 
@@ -753,6 +1056,7 @@ async def count_attachments() -> int:
 
 
 async def add_digest_log(
+    user_id: str,
     *,
     day: str | None,
     kind: str,
@@ -762,26 +1066,29 @@ async def add_digest_log(
 ) -> tuple[str, bool]:
     """写入一条发送记录，返回 (id, 是否新写入)。
 
-    幂等键是 `(day, kind, sent)`：同一天同一 kind 同一结果重复提交返回已有 id。
-    这样 bot 重启/重试不会把"今天发过没有"的答案搞成 2 —— 对收件人来说
-    重发一条摘要比漏发更糟，所以这里的幂等是刻意的。
+    幂等键是 `(user_id, day, kind, sent)`：同一个用户同一天同一 kind 同一结果
+    重复提交返回已有 id。这样 bot 重启/重试不会把"今天发过没有"的答案搞成 2 ——
+    对收件人来说重发一条摘要比漏发更糟，所以这里的幂等是刻意的。
     """
     d = (day or "").strip() or local_day()
     sent_int = 1 if sent else 0
     log_id = new_id()
     rowcount = await execute(
-        """INSERT INTO digest_log (id, day, kind, text, sent, error, ts)
-           SELECT ?,?,?,?,?,?,?
+        """INSERT INTO digest_log (id, user_id, day, kind, text, sent, error, ts)
+           SELECT ?,?,?,?,?,?,?,?
            WHERE NOT EXISTS (
-             SELECT 1 FROM digest_log WHERE day=? AND kind=? AND sent=?
+             SELECT 1 FROM digest_log WHERE user_id=? AND day=? AND kind=? AND sent=?
            )""",
-        (log_id, d, kind, text, sent_int, error, now_ms(), d, kind, sent_int),
+        (
+            log_id, user_id, d, kind, text, sent_int, error, now_ms(),
+            user_id, d, kind, sent_int,
+        ),
     )
     if rowcount == 0:
         existing = await fetch_one(
-            """SELECT id FROM digest_log WHERE day=? AND kind=? AND sent=?
+            """SELECT id FROM digest_log WHERE user_id=? AND day=? AND kind=? AND sent=?
                ORDER BY ts ASC, id ASC LIMIT 1""",
-            (d, kind, sent_int),
+            (user_id, d, kind, sent_int),
         )
         return (existing["id"] if existing else log_id), False
     return log_id, True
@@ -806,6 +1113,7 @@ def _digest_log_filters(
 
 
 async def list_digest_logs(
+    user_id: str,
     *,
     day: str | None = None,
     kind: str | None = None,
@@ -813,17 +1121,27 @@ async def list_digest_logs(
     limit: int = 50,
 ) -> list[dict]:
     where, params = _digest_log_filters(day, kind, sent)
+    # user_id 放最前：它是**必需**条件，其余是可选过滤
+    glue = " AND " if where else " WHERE "
     return await fetch_all(
-        f"SELECT * FROM digest_log{where} ORDER BY ts DESC, id DESC LIMIT ?",
-        (*params, int(limit)),
+        f"SELECT * FROM digest_log{where}{glue}user_id=? ORDER BY ts DESC, id DESC LIMIT ?",
+        (*params, user_id, int(limit)),
     )
 
 
 async def count_digest_logs(
-    *, day: str | None = None, kind: str | None = None, sent: bool | None = None
+    user_id: str,
+    *,
+    day: str | None = None,
+    kind: str | None = None,
+    sent: bool | None = None,
 ) -> int:
     where, params = _digest_log_filters(day, kind, sent)
-    return await count_of(f"SELECT COUNT(*) AS c FROM digest_log{where}", params)
+    glue = " AND " if where else " WHERE "
+    return await count_of(
+        f"SELECT COUNT(*) AS c FROM digest_log{where}{glue}user_id=?",
+        (*params, user_id),
+    )
 
 
 # --------------------------------------------------------------------------
@@ -839,73 +1157,244 @@ def _state_expired(row: dict, now: int) -> bool:
 
 
 async def put_state(
-    namespace: str, key: str, value_json: str, expires_at: int | None = None
+    user_id: str, namespace: str, key: str, value_json: str, expires_at: int | None = None
 ) -> dict:
     stamp = now_ms()
     await execute(
-        """INSERT INTO bot_state (namespace, "key", value, expires_at, created_at, updated_at)
-           VALUES (?,?,?,?,?,?)
-           ON CONFLICT(namespace, "key") DO UPDATE SET
+        """INSERT INTO bot_state
+             (user_id, namespace, "key", value, expires_at, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?)
+           ON CONFLICT(user_id, namespace, "key") DO UPDATE SET
              value=excluded.value,
              expires_at=excluded.expires_at,
              updated_at=excluded.updated_at""",
-        (namespace, key, value_json, expires_at, stamp, stamp),
+        (user_id, namespace, key, value_json, expires_at, stamp, stamp),
     )
     return {"namespace": namespace, "key": key, "expires_at": expires_at}
 
 
 async def get_state(
-    namespace: str, key: str, *, now: int | None = None
+    user_id: str, namespace: str, key: str, *, now: int | None = None
 ) -> dict | None:
     """取一个键；已过期视为不存在（并顺手删掉）。"""
     moment = now_ms() if now is None else now
     row = await fetch_one(
-        'SELECT * FROM bot_state WHERE namespace=? AND "key"=?', (namespace, key)
+        'SELECT * FROM bot_state WHERE user_id=? AND namespace=? AND "key"=?',
+        (user_id, namespace, key),
     )
     if row is None:
         return None
     if _state_expired(row, moment):
-        await delete_state(namespace, key)
+        await delete_state(user_id, namespace, key)
         return None
     return row
 
 
-async def delete_state(namespace: str, key: str) -> bool:
+async def delete_state(user_id: str, namespace: str, key: str) -> bool:
     return (
         await execute(
-            'DELETE FROM bot_state WHERE namespace=? AND "key"=?', (namespace, key)
+            'DELETE FROM bot_state WHERE user_id=? AND namespace=? AND "key"=?',
+            (user_id, namespace, key),
         )
         > 0
     )
 
 
 async def list_state(
-    namespace: str, *, limit: int | None = None, now: int | None = None
+    user_id: str, namespace: str, *, limit: int | None = None, now: int | None = None
 ) -> list[dict]:
-    """列出一个 namespace 下**未过期**的键值。"""
+    """列出一个用户某个 namespace 下**未过期**的键值。"""
     moment = now_ms() if now is None else now
     sql = (
-        'SELECT * FROM bot_state WHERE namespace=? AND (expires_at IS NULL OR expires_at > ?)'
+        "SELECT * FROM bot_state WHERE user_id=? AND namespace=?"
+        " AND (expires_at IS NULL OR expires_at > ?)"
         ' ORDER BY updated_at DESC, "key" ASC'
     )
-    params: list[Any] = [namespace, moment]
+    params: list[Any] = [user_id, namespace, moment]
     if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
     rows = await fetch_all(sql, params)
-    await purge_expired_state(namespace, now=moment)
+    await purge_expired_state(namespace, user_id=user_id, now=moment)
     return rows
 
 
-async def purge_expired_state(namespace: str | None = None, *, now: int | None = None) -> int:
-    """顺手清掉过期行 —— 只是省空间，读取路径不依赖它。"""
+async def purge_expired_state(
+    namespace: str | None = None, *, user_id: str | None = None, now: int | None = None
+) -> int:
+    """顺手清掉过期行 —— 只是省空间，读取路径不依赖它。
+
+    `user_id=None` 时是**跨用户的全局清理**（运维用，不向任何人返回数据）。
+    这是全项目唯一一处刻意不按用户过滤的**写**操作（读的那一处是
+    `find_subscribers` 的投递名单），所以它走 `_execute_unscoped` 显式绕过
+    护栏 —— 绕过得写出来，不能是疏忽。
+    """
     moment = now_ms() if now is None else now
-    if namespace is None:
-        return await execute(
-            "DELETE FROM bot_state WHERE expires_at IS NOT NULL AND expires_at <= ?",
-            (moment,),
-        )
-    return await execute(
-        'DELETE FROM bot_state WHERE namespace=? AND expires_at IS NOT NULL AND expires_at <= ?',
-        (namespace, moment),
+    clauses = ["expires_at IS NOT NULL", "expires_at <= ?"]
+    params: list[Any] = [moment]
+    if user_id is not None:
+        clauses.insert(0, "user_id=?")
+        params.insert(0, user_id)
+    if namespace is not None:
+        clauses.insert(0, "namespace=?")
+        params.insert(0, namespace)
+    return await _execute_unscoped(
+        f"DELETE FROM bot_state WHERE {' AND '.join(clauses)}", tuple(params)
     )
+
+
+# --------------------------------------------------------------------------
+# 订阅（契约 §12）
+#
+# 这一层只做 SQL，不做好坏判断 —— "sender_id 不能为空、不能是通配符"之类
+# 属于业务规则，放在 subscriptions.py，这样从 bot / 前端进来的写入都过同一道关。
+# --------------------------------------------------------------------------
+
+
+async def insert_subscription(
+    user_id: str,
+    group_id: str,
+    sender_id: str,
+    *,
+    group_name: str | None = None,
+    sender_name: str | None = None,
+    note: str | None = None,
+) -> tuple[dict, bool]:
+    """写入（或重新启用）一条订阅。返回 `(行, 是否新建)`。
+
+    同一个人对同一个 (群, 发送者) 再订一次**不报错**：这和"把一个关掉的订阅
+    重新打开"是同一个意图，报 409 只会逼前端多做一次查询。
+
+    名字和备注只在**非空**时覆盖：重新订阅时前端可能只填了 id，
+    不该把之前记下的群名抹掉。
+    """
+    existing = await fetch_one(
+        "SELECT * FROM subscription WHERE user_id=? AND group_id=? AND sender_id=?",
+        (user_id, group_id, sender_id),
+    )
+    stamp = now_ms()
+    clean = {
+        "group_name": (group_name or "").strip() or None,
+        "sender_name": (sender_name or "").strip() or None,
+        "note": (note or "").strip() or None,
+    }
+    if existing:
+        await execute(
+            """UPDATE subscription SET
+                 enabled=1,
+                 group_name=COALESCE(?, group_name),
+                 sender_name=COALESCE(?, sender_name),
+                 note=COALESCE(?, note),
+                 updated_at=?
+               WHERE id=? AND user_id=?""",
+            (clean["group_name"], clean["sender_name"], clean["note"], stamp, existing["id"], user_id),
+        )
+        row = await fetch_one(
+            "SELECT * FROM subscription WHERE id=? AND user_id=?", (existing["id"], user_id)
+        )
+        return row or existing, False
+
+    sub_id = new_id("sub_")
+    await execute(
+        """INSERT INTO subscription
+             (id, user_id, group_id, sender_id, group_name, sender_name, note,
+              enabled, created_at, updated_at)
+           VALUES (?,?,?,?,?,?,?,1,?,?)""",
+        (
+            sub_id,
+            user_id,
+            group_id,
+            sender_id,
+            clean["group_name"],
+            clean["sender_name"],
+            clean["note"],
+            stamp,
+            stamp,
+        ),
+    )
+    row = await fetch_one("SELECT * FROM subscription WHERE id=? AND user_id=?", (sub_id, user_id))
+    return row or {"id": sub_id, "user_id": user_id, "group_id": group_id, "sender_id": sender_id}, True
+
+
+async def list_subscriptions(
+    user_id: str, *, include_disabled: bool = True, limit: int | None = None
+) -> list[dict]:
+    sql = "SELECT * FROM subscription WHERE user_id=?"
+    params: list[Any] = [user_id]
+    if not include_disabled:
+        sql += " AND enabled=1"
+    sql += " ORDER BY updated_at DESC, id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(int(limit))
+    return await fetch_all(sql, params)
+
+
+async def get_subscription(user_id: str, sub_id: str) -> dict | None:
+    return await fetch_one(
+        "SELECT * FROM subscription WHERE id=? AND user_id=?", (sub_id, user_id)
+    )
+
+
+async def update_subscription(
+    user_id: str, sub_id: str, fields: dict
+) -> dict | None:
+    """只改传进来的字段。字段名由调用方（subscriptions.py）白名单过滤过。"""
+    allowed = ("enabled", "note", "group_name", "sender_name")
+    sets = [f"{name}=?" for name in allowed if name in fields]
+    if not sets:
+        return await get_subscription(user_id, sub_id)
+    params: list[Any] = [fields[name] for name in allowed if name in fields]
+    params.extend([now_ms(), sub_id, user_id])
+    changed = await execute(
+        f"UPDATE subscription SET {', '.join(sets)}, updated_at=? WHERE id=? AND user_id=?",
+        tuple(params),
+    )
+    if changed == 0:
+        return None
+    return await get_subscription(user_id, sub_id)
+
+
+async def delete_subscription(user_id: str, sub_id: str) -> bool:
+    return (
+        await execute(
+            "DELETE FROM subscription WHERE id=? AND user_id=?", (sub_id, user_id)
+        )
+        > 0
+    )
+
+
+async def count_subscriptions(user_id: str, *, enabled_only: bool = False) -> int:
+    sql = "SELECT COUNT(*) AS c FROM subscription WHERE user_id=?"
+    if enabled_only:
+        sql += " AND enabled=1"
+    return await count_of(sql, (user_id,))
+
+
+async def find_subscribers(group_id: str, sender_id: str | None = None) -> list[str]:
+    """**投递名单**：这条 (群, 发送者) 的消息，哪些用户要？
+
+    这是全项目唯一一处刻意跨用户读的用户表查询（理由见 `_fetch_all_unscoped`）。
+    只返回 user_id，不返回订阅行的其他内容 —— bot 只需要知道"扇给谁"，
+    每个用户各自的 group_name / note 是他们的私事。
+
+    `sender_id=None` 表示"这个群里**任何**发送者" —— 缺口告警用它：
+    缺口是群级事件（"这个群中间断了一段"），凡是订了这个群里任何人的用户都该知道，
+    而投递名单本身仍然是按 (群, 发送者) 的，两种语义不要混。
+
+    服务端去重（DISTINCT）而不是让 bot 去重：唯一约束在这里是
+    (user_id, group_id, sender_id)，理论上一个人对同一个发送者只会有一行，
+    但同一个人可以订同一个群里的多个人 —— 缺口告警必须只通知他一次。
+    """
+    clauses = ["group_id=?", "enabled=1"]
+    params: list[Any] = [str(group_id)]
+    if sender_id is not None:
+        clauses.append("sender_id=?")
+        params.append(str(sender_id))
+    rows = await _fetch_all_unscoped(
+        f"SELECT DISTINCT user_id FROM subscription WHERE {' AND '.join(clauses)}"
+        " ORDER BY user_id",
+        tuple(params),
+    )
+    return [str(r["user_id"]) for r in rows if r.get("user_id")]
+

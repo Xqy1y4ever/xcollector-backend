@@ -48,8 +48,13 @@ def _key() -> bytes:
     return hmac.new(_CONTEXT, secret.encode("utf-8"), hashlib.sha256).digest()
 
 
-def _signature(key: bytes, att_id: str, exp: int) -> str:
-    return hmac.new(key, f"{att_id}.{exp}".encode("utf-8"), hashlib.sha256).hexdigest()[:_SIG_LEN]
+def _signature(key: bytes, user_id: str, att_id: str, exp: int) -> str:
+    # user_id 进签名内容：**这是多用户下最关键的一行**。
+    # 不绑的话，拿到别人通知里那条链接的人就能看别人的附件 ——
+    # 而那条链接本身看起来完全正常。
+    return hmac.new(
+        key, f"{user_id}.{att_id}.{exp}".encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:_SIG_LEN]
 
 
 def attachment_path(att_id: str) -> str:
@@ -57,31 +62,47 @@ def attachment_path(att_id: str) -> str:
     return f"/api/attachments/{quote(str(att_id), safe='')}"
 
 
-def sign_attachment_url(att_id: str, *, now: int | None = None) -> str:
-    """签发一个带过期时间的附件 URL。
+def sign_attachment_url(user_id: str, att_id: str, *, now: int | None = None) -> str:
+    """签发一个带过期时间、且**只对某个用户有效**的附件 URL。
 
-    没配密钥或 TTL<=0 时返回裸路径 —— 那种情况下下载接口仍然接受 Bearer。
+    没有可用密钥 / TTL<=0 / **没有归属** 时都返回裸路径 —— 那几种情况下
+    下载接口仍然接受 Bearer，而 Bearer 是有身份的，所以不会因此串数据。
+
+    「没有归属」这一条是必须的，不是省事：`GET /api/messages*` 是共享层，
+    它没有 owner 可以绑。以前这里会签出一条 `?exp=..&u=&sig=..` 的链接，
+    而校验侧要求 `u` 非空 —— **那条链接永远 401**，而且看起来完全正常
+    （有 exp 有 sig）。宁可返回裸路径：它诚实地说"我得靠 Bearer"，
+    而不是伪造一个用不了的签名。
     """
     base = attachment_path(att_id)
+    owner = str(user_id or "").strip()
     key = _key()
+    if not owner or not key:
+        return base
     try:
         ttl = int(get_settings().attachment_url_ttl or 0)
     except (TypeError, ValueError):
         ttl = 0
-    if not key or ttl <= 0:
+    if ttl <= 0:
         return base
     exp = int(now if now is not None else time.time()) + ttl
-    return f"{base}?exp={exp}&sig={_signature(key, str(att_id), exp)}"
+    # `u=` 必须带上：下载请求**没有 Authorization 头**（浏览器 <img> 带不了），
+    # 验证方只能从 URL 里知道"这条链接是给谁的"。它进了签名内容，改不动。
+    return (
+        f"{base}?exp={exp}&u={quote(owner, safe='')}"
+        f"&sig={_signature(key, owner, str(att_id), exp)}"
+    )
 
 
 def verify_attachment_sig(
+    user_id: str,
     att_id: str,
     exp: object,
     sig: object,
     *,
     now: int | None = None,
 ) -> bool:
-    """校验签名与过期时间。任何异常都返回 False（**失败即拒绝**）。"""
+    """校验签名、归属与过期时间。任何异常都返回 False（**失败即拒绝**）。"""
     key = _key()
     if not key:
         return False
@@ -92,7 +113,9 @@ def verify_attachment_sig(
     if exp_i < int(now if now is not None else time.time()):
         return False
     # 定长比较，避免通过响应时间逐字节猜签名
-    return secrets.compare_digest(_signature(key, str(att_id), exp_i), str(sig or ""))
+    return secrets.compare_digest(
+        _signature(key, str(user_id), str(att_id), exp_i), str(sig or "")
+    )
 
 
 def _attachment_id_of(item: dict) -> str:
@@ -107,8 +130,8 @@ def _attachment_id_of(item: dict) -> str:
     return ""
 
 
-def sign_attachments(items: object) -> list[dict]:
-    """把附件列表里的 `url` 换成现签的签名 URL。非列表/非 dict 原样保留。"""
+def sign_attachments(user_id: str, items: object) -> list[dict]:
+    """把附件列表里的 `url` 换成现签的、**绑定该用户**的签名 URL。"""
     if not isinstance(items, list):
         return []
     out: list[dict] = []
@@ -121,5 +144,5 @@ def sign_attachments(items: object) -> list[dict]:
             out.append(dict(item))
             continue
         # 覆盖式写 url：库里存的裸路径在这里被换成带 exp+sig 的版本
-        out.append({**item, "url": sign_attachment_url(att_id)})
+        out.append({**item, "url": sign_attachment_url(user_id, att_id)})
     return out

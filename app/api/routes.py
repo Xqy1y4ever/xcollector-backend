@@ -33,8 +33,10 @@ from ..auth import (
     require_token,
     require_user,
     resolve_owner,
+    resolve_owner_optional,
 )
 from ..config import get_settings
+from .. import subscriptions
 from ..signing import verify_attachment_sig
 from ..db import (
     NOTIFICATION_PATCHABLE,
@@ -83,6 +85,7 @@ from ..users import (
     count_users,
     create_invite,
     get_user_by_id,
+    get_user_by_qq,
     issue_verify_code,
     list_invites,
     list_users,
@@ -301,12 +304,20 @@ class NotificationBody(BaseModel):
 
 
 @router.post("/notifications", dependencies=[WriteDep])
-async def create_notification(body: NotificationBody):
-    """创建或更新通知（幂等：`raw_message_id` 唯一）。
+async def create_notification(
+    body: NotificationBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None, description="服务令牌必须显式指定归属用户"),
+):
+    """创建或更新通知（幂等：`(user_id, raw_message_id)` 唯一）。
+
+    **按用户扇出**：同一个 raw_message 被 N 个用户订阅，bot 就在这里写 N 次、
+    每次带不同的 user_id。抽取只跑一次，这里只是把结果分发给各人。
 
     `evidence` 为空直接 400 —— 这是后端替 bot 守住的硬约束：
     没有证据的条目不许入库（防的是模型幻觉出一条无据的任务）。
     """
+    owner = resolve_owner(identity, user_id)
     evidence = "" if body.evidence is None else str(body.evidence)
     if not evidence.strip():
         raise HTTPException(
@@ -315,6 +326,7 @@ async def create_notification(body: NotificationBody):
         )
 
     notif_id, created = await upsert_notification(
+        owner,
         {
             "raw_message_id": body.raw_message_id,
             "group_id": body.group_id,
@@ -334,11 +346,12 @@ async def create_notification(body: NotificationBody):
             "extractor": body.extractor,
             "model": body.model,
             "prompt_ver": body.prompt_ver,
-        }
+        },
     )
     logger.info(
-        "通知落库：id=%s created=%s 标题=%s",
+        "通知落库：id=%s user=%s created=%s 标题=%s",
         notif_id,
+        owner,
         created,
         preview(body.title),
     )
@@ -347,27 +360,46 @@ async def create_notification(body: NotificationBody):
 
 @router.get("/notifications")
 async def get_notifications(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None, description="服务令牌必须显式指定"),
     since: int | None = Query(default=None, description="只返回 updated_at > since 的行"),
     status: str = Query(default="all"),
     q: str | None = Query(default=None),
     limit: int = Query(default=500, ge=1, le=2000),
     count_only: str | None = Query(default=None),
 ):
-    """通知列表（**读投影**：人工修正已覆盖、status 已推导）。"""
+    """通知列表（**读投影**：人工修正已覆盖、status 已推导）。
+
+    用户令牌只能看到自己的；服务令牌要按用户读（bot 发摘要时逐个用户拉）。
+    """
+    owner = resolve_owner(identity, user_id)
     if _flag(count_only):
-        return {"count": await count_notification_views(since=since, status=status, q=q)}
-    views = await list_notification_views(since=since, status=status, q=q, limit=limit)
+        return {
+            "count": await count_notification_views(
+                owner, since=since, status=status, q=q
+            )
+        }
+    views = await list_notification_views(
+        owner, since=since, status=status, q=q, limit=limit
+    )
     return {"server_time": now_ms(), "notifications": views}
 
 
 @router.get("/notifications/{notif_id}")
-async def get_notification_detail(notif_id: str):
-    view = await get_notification_view(notif_id)
+async def get_notification_detail(
+    notif_id: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    view = await get_notification_view(owner, notif_id)
     if view is None:
+        # 别人的条目也走这条 —— 不区分"不存在"和"不是你的"，
+        # 否则可以用它探测"这个 id 存在吗"。
         raise HTTPException(status_code=404, detail="通知不存在")
-    row = await get_notification_row(notif_id)
+    row = await get_notification_row(notif_id, owner)
     raw = await get_raw(row["raw_message_id"]) if row else None
-    return {"notification": view, "raw": raw_view(raw)}
+    return {"notification": view, "raw": raw_view(raw, owner)}
 
 
 class NotificationPatch(BaseModel):
@@ -387,13 +419,19 @@ class NotificationPatch(BaseModel):
 
 
 @router.patch("/notifications/{notif_id}", dependencies=[WriteDep])
-async def patch_notification_route(notif_id: str, body: NotificationPatch):
+async def patch_notification_route(
+    notif_id: str,
+    body: NotificationPatch,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
     """bot 重跑时改机器字段。
 
     **不允许改 `status` 和 `read`** —— 那两个只能走 corrections 与 /read，
     因为要留痕。传了会被忽略，响应里的最终值就是它们现在的真实取值。
     """
-    if await get_notification_row(notif_id) is None:
+    owner = resolve_owner(identity, user_id)
+    if await get_notification_row(notif_id, owner) is None:
         raise HTTPException(status_code=404, detail="通知不存在")
 
     provided = body.model_dump(exclude_unset=True)
@@ -423,15 +461,20 @@ async def patch_notification_route(notif_id: str, body: NotificationPatch):
         else:
             fields[key] = None if value is None else str(value)
 
-    await patch_notification(notif_id, fields)
+    await patch_notification(notif_id, owner, fields)
     if ignored:
         logger.info("PATCH /notifications/%s 忽略了不可改字段：%s", notif_id, ignored)
-    return await get_notification_view(notif_id)
+    return await get_notification_view(owner, notif_id)
 
 
 @router.delete("/notifications/{notif_id}", dependencies=[WriteDep])
-async def delete_notification_route(notif_id: str):
-    if not await delete_notification(notif_id):
+async def delete_notification_route(
+    notif_id: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    if not await delete_notification(notif_id, owner):
         raise HTTPException(status_code=404, detail="通知不存在")
     return {"deleted": True}
 
@@ -441,18 +484,29 @@ class CorrectionBody(BaseModel):
 
     field: str
     value: Any = None
-    user_id: str = "web"
+    # 谁操作的（界面上显示"谁改的"），**不是**租户 —— 租户从令牌来
+    actor: str = "web"
 
 
 @router.post("/notifications/{notif_id}/corrections")
-async def create_correction(notif_id: str, body: CorrectionBody):
-    """人工修正（只追加）。展示时它会覆盖 notification 里的机器值。"""
+async def create_correction(
+    notif_id: str,
+    body: CorrectionBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    """人工修正（只追加）。展示时它会覆盖 notification 里的机器值。
+
+    这是**用户**能做的写操作之一（另一个是已读），所以不挂 WriteDep：
+    网页令牌本来就要能改自己条目的解读。
+    """
+    owner = resolve_owner(identity, user_id)
     if body.field not in CORRECTABLE_FIELDS:
         raise HTTPException(
             status_code=400,
             detail=f"不可修正的字段：{body.field}（只能是 {list(CORRECTABLE_FIELDS)}）",
         )
-    if await get_notification_row(notif_id) is None:
+    if await get_notification_row(notif_id, owner) is None:
         raise HTTPException(status_code=404, detail="通知不存在")
 
     value = body.value
@@ -472,15 +526,20 @@ async def create_correction(notif_id: str, body: CorrectionBody):
     else:
         value = "" if value is None else str(value)
 
-    await add_correction(notif_id, body.field, value, body.user_id or "web")
-    return {"ok": True, "notification": await get_notification_view(notif_id)}
+    await add_correction(notif_id, owner, body.field, value, body.actor or "web")
+    return {"ok": True, "notification": await get_notification_view(owner, notif_id)}
 
 
 @router.get("/notifications/{notif_id}/corrections")
-async def get_corrections(notif_id: str):
-    if await get_notification_row(notif_id) is None:
+async def get_corrections(
+    notif_id: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    if await get_notification_row(notif_id, owner) is None:
         raise HTTPException(status_code=404, detail="通知不存在")
-    return {"corrections": await list_corrections(notif_id)}
+    return {"corrections": await list_corrections(notif_id, owner)}
 
 
 class ReadBody(BaseModel):
@@ -490,10 +549,16 @@ class ReadBody(BaseModel):
 
 
 @router.post("/notifications/{notif_id}/read")
-async def mark_read(notif_id: str, body: ReadBody):
-    if await get_notification_row(notif_id) is None:
+async def mark_read(
+    notif_id: str,
+    body: ReadBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    if await get_notification_row(notif_id, owner) is None:
         raise HTTPException(status_code=404, detail="通知不存在")
-    await set_read(notif_id, body.read)
+    await set_read(notif_id, owner, body.read)
     return {"read": body.read}
 
 
@@ -517,28 +582,28 @@ async def require_download(
     att_id: str,
     exp: Annotated[str | None, Query()] = None,
     sig: Annotated[str | None, Query()] = None,
+    u: Annotated[str | None, Query()] = None,
     identity: Annotated[Identity | None, Depends(optional_token)] = None,
 ) -> None:
     """附件下载的鉴权：**有效签名 URL 或有效 Bearer 令牌**，任一即可。
 
     这是全项目**唯一**允许不带 Authorization 头的接口，因为浏览器用
-    `<img src>` / `<a href>` 取附件时根本带不了那个头。签名由 signing.py 发，
-    读投影里每次现签、带过期时间。
+    `<img src>` / `<a href>` 取附件时根本带不了那个头。签名由 signing.py 发：
+    读投影里每次现签、带过期时间，而且**绑定了 user_id**（签在 `u=` 里）。
 
     三条放行路径：
       1. 没配 API_TOKEN（本地开发）—— 与其它接口一致，不校验
       2. 带了有效 Bearer
-      3. `exp` + `sig` 签名有效且未过期
-    都不满足 → 401。
+      3. `u` + `exp` + `sig` 签名有效且未过期
 
-    ⚠️ 多用户下签名**必须绑定 user_id**（Phase 2）—— 否则拿到别人通知里的
-    链接就能看别人的附件。当前签名还没绑，见 signing.py 的 TODO。
+    都不满足 → 401。绑 user_id 的意义：拿到别人通知里那条链接的人，
+    验签过不去 —— 链接看起来完全正常，但只对签给它的人有效。
     """
     if not get_settings().auth_enabled:
         return
     if identity is not None:
         return
-    if verify_attachment_sig(att_id, exp, sig):
+    if u and verify_attachment_sig(u, att_id, exp, sig):
         return
     raise HTTPException(
         status_code=401,
@@ -681,6 +746,23 @@ async def list_users_route():
     return {"users": await list_users(), "count": await count_users()}
 
 
+@router.get("/users/lookup", dependencies=[WriteDep])
+async def lookup_user_route(qq: str = Query(...)):
+    """按 QQ 号查用户。服务令牌专属。
+
+    这是 bot 的**身份解析**入口：QQ 侧的一切身份锚点都是 QQ 号（谁发的消息、
+    谁发的指令），而数据层的租户是 `user_id`。少了这一步，bot 就只能靠
+    "QQ 号当 user_id 用" —— 那正好是串数据的经典写法。
+
+    查不到返回 404 而不是空对象：调用方（bot）需要能区分"这个人还没注册"
+    和"后端没答上来"，前者要提示他去注册，后者要保持 pending 重试。
+    """
+    user = await get_user_by_qq(qq)
+    if user is None:
+        raise HTTPException(status_code=404, detail="这个 QQ 还没有注册")
+    return {"user": public_user(user)}
+
+
 # --------------------------------------------------------------------------
 # 4. 群状态 group_state
 # --------------------------------------------------------------------------
@@ -725,27 +807,40 @@ class GapAlertBody(BaseModel):
 
 
 @router.post("/gap-alerts", dependencies=[WriteDep])
-async def create_gap_alert(body: GapAlertBody):
+async def create_gap_alert(
+    body: GapAlertBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
     alert_id = await add_gap_alert(
-        body.group_id, body.group_name, body.from_ts, body.to_ts, body.reason
+        owner, body.group_id, body.group_name, body.from_ts, body.to_ts, body.reason
     )
     return {"id": alert_id}
 
 
 @router.get("/gap-alerts")
 async def get_gap_alerts(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
     acknowledged: str | None = Query(default=None),
     limit: int = Query(default=20, ge=1, le=1000),
 ):
+    owner = resolve_owner(identity, user_id)
     rows = await list_gap_alerts(
-        acknowledged=_optional_flag(acknowledged, "acknowledged"), limit=limit
+        owner, acknowledged=_optional_flag(acknowledged, "acknowledged"), limit=limit
     )
     return {"alerts": [{**row, "acknowledged": bool(row.get("acknowledged"))} for row in rows]}
 
 
 @router.post("/gap-alerts/{alert_id}/ack", dependencies=[WriteDep])
-async def ack_gap_alert_route(alert_id: str):
-    if not await ack_gap_alert(alert_id):
+async def ack_gap_alert_route(
+    alert_id: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    if not await ack_gap_alert(alert_id, owner):
         raise HTTPException(status_code=404, detail="缺口告警不存在")
     return {"acknowledged": True}
 
@@ -763,7 +858,12 @@ class StatsBody(BaseModel):
 
 
 @router.post("/stats", dependencies=[WriteDep])
-async def create_stats(body: StatsBody):
+async def create_stats(
+    body: StatsBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
     increments: dict[str, int] = {}
     for key, value in body.fields.items():
         if key not in STAT_FIELDS:
@@ -772,12 +872,16 @@ async def create_stats(body: StatsBody):
         if parsed is None:
             raise HTTPException(status_code=400, detail=f"{key} 必须是整数")
         increments[key] = parsed
-    return await add_stats(body.day, increments)
+    return await add_stats(owner, body.day, increments)
 
 
 @router.get("/stats")
-async def get_stats(day: str | None = Query(default=None)):
-    return await get_stat(day)
+async def get_stats(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+    day: str | None = Query(default=None),
+):
+    return await get_stat(resolve_owner(identity, user_id), day)
 
 
 # --------------------------------------------------------------------------
@@ -796,30 +900,53 @@ class DigestLogBody(BaseModel):
 
 
 @router.post("/digest-log", dependencies=[WriteDep])
-async def create_digest_log(body: DigestLogBody):
-    """记录一次发送（幂等键 `(day, kind, sent)`，见 db.add_digest_log）。
+async def create_digest_log(
+    body: DigestLogBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    """记录一次发送（幂等键 `(user_id, day, kind, sent)`，见 db.add_digest_log）。
 
     `kind` 的取值由 bot 定义，后端只存字符串。
+    **摘要记录必须按用户分开**：否则"今天给 A 发过没有"会被 B 的记录顶掉。
     """
+    owner = resolve_owner(identity, user_id)
     log_id, created = await add_digest_log(
-        day=body.day, kind=body.kind, text=body.text, sent=body.sent, error=body.error
+        owner,
+        day=body.day,
+        kind=body.kind,
+        text=body.text,
+        sent=body.sent,
+        error=body.error,
     )
-    logger.info("digest 记录：id=%s created=%s kind=%s sent=%s", log_id, created, body.kind, body.sent)
+    logger.info(
+        "digest 记录：id=%s user=%s created=%s kind=%s sent=%s",
+        log_id,
+        owner,
+        created,
+        body.kind,
+        body.sent,
+    )
     return {"id": log_id}
 
 
 @router.get("/digest-log")
 async def get_digest_log(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
     day: str | None = Query(default=None),
     kind: str | None = Query(default=None),
     sent: str | None = Query(default=None),
     limit: int = Query(default=50, ge=1, le=1000),
     count_only: str | None = Query(default=None),
 ):
+    owner = resolve_owner(identity, user_id)
     sent_flag = _optional_flag(sent, "sent")
     if _flag(count_only):
-        return {"count": await count_digest_logs(day=day, kind=kind, sent=sent_flag)}
-    rows = await list_digest_logs(day=day, kind=kind, sent=sent_flag, limit=limit)
+        return {
+            "count": await count_digest_logs(owner, day=day, kind=kind, sent=sent_flag)
+        }
+    rows = await list_digest_logs(owner, day=day, kind=kind, sent=sent_flag, limit=limit)
     return {"logs": [{**row, "sent": bool(row.get("sent"))} for row in rows]}
 
 
@@ -836,7 +963,14 @@ class StateBody(BaseModel):
 
 
 @router.put("/state/{namespace}/{key}", dependencies=[WriteDep])
-async def put_state_route(namespace: str, key: str, body: StateBody):
+async def put_state_route(
+    namespace: str,
+    key: str,
+    body: StateBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
     expires_at = None
     if body.ttl_seconds is not None:
         ttl = as_int(body.ttl_seconds)
@@ -844,14 +978,19 @@ async def put_state_route(namespace: str, key: str, body: StateBody):
             raise HTTPException(status_code=400, detail="ttl_seconds 必须是非负整数")
         expires_at = now_ms() + ttl * 1000
 
-    await put_state(namespace, key, _json_text(body.value, None), expires_at)
+    await put_state(owner, namespace, key, _json_text(body.value, None), expires_at)
     return {"ok": True, "expires_at": expires_at}
 
 
 @router.get("/state/{namespace}/{key}")
-async def get_state_route(namespace: str, key: str):
+async def get_state_route(
+    namespace: str,
+    key: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
     """已过期或不存在一律 404 —— 过期判定在读取时做，不依赖后台清理。"""
-    row = await get_state(namespace, key)
+    row = await get_state(resolve_owner(identity, user_id), namespace, key)
     if row is None:
         raise HTTPException(status_code=404, detail="键不存在或已过期")
     return {
@@ -862,15 +1001,25 @@ async def get_state_route(namespace: str, key: str):
 
 
 @router.delete("/state/{namespace}/{key}", dependencies=[WriteDep])
-async def delete_state_route(namespace: str, key: str):
+async def delete_state_route(
+    namespace: str,
+    key: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
     """删除是幂等的：键本来就不存在也返回成功（后置条件都成立）。"""
-    await delete_state(namespace, key)
+    await delete_state(resolve_owner(identity, user_id), namespace, key)
     return {"deleted": True}
 
 
 @router.get("/state/{namespace}")
-async def list_state_route(namespace: str, count_only: str | None = Query(default=None)):
-    rows = await list_state(namespace)
+async def list_state_route(
+    namespace: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+    count_only: str | None = Query(default=None),
+):
+    rows = await list_state(resolve_owner(identity, user_id), namespace)
     if _flag(count_only):
         return {"count": len(rows)}
     return {
@@ -886,7 +1035,154 @@ async def list_state_route(namespace: str, count_only: str | None = Query(defaul
 
 
 # --------------------------------------------------------------------------
-# 9. 健康：只报存储自身
+# 9. 订阅 subscription（契约 §12）
+#
+# 这是多用户之后**用户唯一能改的东西**：他订哪些 (群, 发送者)。
+# bot 处理所有用户订阅的并集，抽一次，再按订阅扇出。
+# --------------------------------------------------------------------------
+
+
+class SubscriptionBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    group_id: str
+    sender_id: str
+    group_name: str | None = None
+    sender_name: str | None = None
+    note: str | None = None
+
+
+class SubscriptionPatchBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    enabled: bool | None = None
+    note: str | None = None
+    group_name: str | None = None
+    sender_name: str | None = None
+
+
+@router.get("/subscriptions")
+async def list_subscriptions_route(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+    include_disabled: str | None = Query(default=None),
+):
+    """我的订阅。用户令牌看自己，服务令牌要显式带 user_id。"""
+    owner = resolve_owner(identity, user_id)
+    rows = await subscriptions.list_for_user(
+        owner, include_disabled=include_disabled is None or _flag(include_disabled)
+    )
+    return {"subscriptions": rows, "count": len(rows)}
+
+
+@router.post("/subscriptions")
+async def add_subscription_route(
+    body: SubscriptionBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    """订一个 (群, 发送者)。
+
+    **刻意不挂 `WriteDep`**：这是用户自己配置自己的东西，用 UserToken 就该能改
+    （和 corrections / read 一致）。服务令牌也能调，但必须显式带 user_id ——
+    那是 bot 处理 QQ 侧 `/订阅` 指令时用的路径。
+
+    `sender_id` 是**必填**的，而且不接受 `*` 之类的通配符 —— 订阅的最小单位
+    就是"某个群里某个人说的话"，没有"订整个群"这个选项。
+    理由和挡住它的三层在 subscriptions.py 里。
+    """
+    owner = resolve_owner(identity, user_id)
+    try:
+        sub, created = await subscriptions.add(
+            owner,
+            group_id=body.group_id,
+            sender_id=body.sender_id,
+            group_name=body.group_name,
+            sender_name=body.sender_name,
+            note=body.note,
+        )
+    except subscriptions.SubscriptionError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+    return {"subscription": sub, "created": created}
+
+
+@router.patch("/subscriptions/{sub_id}")
+async def patch_subscription_route(
+    sub_id: str,
+    body: SubscriptionPatchBody,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    try:
+        sub = await subscriptions.patch(
+            owner, sub_id, body.model_dump(exclude_none=True)
+        )
+    except subscriptions.SubscriptionError as exc:
+        raise HTTPException(status_code=400, detail=exc.message) from exc
+    if sub is None:
+        # 404 而不是 403：别人的 id 探测不出来（和通知详情一致）
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return {"subscription": sub}
+
+
+@router.delete("/subscriptions/{sub_id}")
+async def delete_subscription_route(
+    sub_id: str,
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    owner = resolve_owner(identity, user_id)
+    if not await subscriptions.remove(owner, sub_id):
+        raise HTTPException(status_code=404, detail="订阅不存在")
+    return {"deleted": True}
+
+
+@router.get("/subscriptions/routing")
+async def routing_route(
+    identity: Annotated[Identity, Depends(require_service)],
+    group_id: str = Query(...),
+    sender_id: str | None = Query(default=None),
+):
+    """**投递名单**：这条消息要扇给谁。服务令牌专属。
+
+    bot 每处理完一条消息就调它一次，拿到 user_id 列表，然后给每个人写一条
+    自己的通知。抽一次、扇多次 —— "并集处理"落地的地方。
+
+    `sender_id` 省略 = "这个群里任何发送者"。只有缺口告警用它：缺口是**群级**
+    事件（"这个群中间断了一段"），凡是订了这个群里任何人的用户都该知道。
+    两种语义不要混：正常投递必须给 sender_id，否则就成了"订整个群"。
+
+    **必须显式要服务令牌**：router 级别的 Bearer 只保证"有身份"，一个普通
+    用户拿着自己的令牌就能看到全局投递名单（谁订了哪个来源），那是别人的
+    订阅关系。所以这里加 `require_service`，不是靠路由分组。
+
+    放在 `/subscriptions/routing` 而不是 `/routing`：它属于订阅这一块。
+    这里刻意**没有** `GET /subscriptions/{sub_id}`，所以 "routing" 不会被
+    当成一个 sub_id 吃掉（PATCH/DELETE 是同路径不同方法，不冲突）。
+    """
+    _ = identity
+    return {"user_ids": await subscriptions.subscribers_for(group_id, sender_id)}
+
+
+@router.get("/sources")
+async def list_sources_route(
+    identity: Annotated[Identity, Depends(require_token)],
+    keyword: str | None = Query(default=None),
+    limit: int = Query(default=subscriptions.SOURCE_LIMIT, ge=1, le=1000),
+):
+    """**信息源目录**：可以订的 (群, 发送者)。
+
+    任何登录用户都能看 —— 新用户注册完手上是空的，没有这份目录就无从订阅。
+    目录从共享层聚合，不含任何按用户的数据。
+    """
+    _ = identity  # 只是为了强制要求登录；目录本身与身份无关
+    rows = await subscriptions.list_sources(keyword=keyword, limit=limit)
+    return {"sources": rows, "count": len(rows)}
+
+
+# --------------------------------------------------------------------------
+# 10. 健康：只报存储自身
 # --------------------------------------------------------------------------
 
 
@@ -903,8 +1199,19 @@ def _storage_writable() -> bool:
 
 
 @router.get("/health")
-async def health():
-    """只报存储自身；QQ 连接、抽取流水线那些状态全在 bot 那边。"""
+async def health(
+    identity: Annotated[Identity, Depends(require_token)],
+    user_id: str | None = Query(default=None),
+):
+    """只报存储自身；QQ 连接、抽取流水线那些状态全在 bot 那边。
+
+    计数按用户算：状态页给用户看的是"你收了多少"，不是全站。
+
+    服务令牌可以**不带** user_id —— 那就是纯存活探针（Dockerfile 的 HEALTHCHECK
+    就是这么调的，它拿不到 user_id）。那种情况下 `counts` 直接返回 None 而不是
+    去查"所有用户"：探针不该顺带做一次无归属查询。
+    """
+    owner = resolve_owner_optional(identity, user_id)
     settings = get_settings()
     storage_ok = True
     try:
@@ -914,18 +1221,23 @@ async def health():
         storage_ok = False
     writable = _storage_writable()
 
+    counts = None
+    if owner is not None:
+        counts = {
+            "messages": await count_messages(),
+            "notifications": await count_notifications(owner),
+            "attachments": await count_attachments(),
+        }
+
     return {
         "ok": storage_ok and writable,
         "server_time": now_ms(),
+        "user_id": owner,
         "storage": {
             "driver": "sqlite",
             "path": str(settings.resolved_db_path),
             "writable": writable,
         },
-        "counts": {
-            "messages": await count_messages(),
-            "notifications": await count_notifications(),
-            "attachments": await count_attachments(),
-        },
+        "counts": counts,
         "version": __version__,
     }

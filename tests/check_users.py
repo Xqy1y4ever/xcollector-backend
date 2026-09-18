@@ -90,6 +90,16 @@ check("坏令牌 → 401", r.status_code, 401)
 r = c.get(f"{API}/health", headers=H)
 check("服务令牌读 → 200", r.status_code, 200)
 
+# 存活探针契约：Dockerfile 的 HEALTHCHECK 只带 API_TOKEN、拿不到 user_id。
+# 这条如果坏了，容器会永远不健康，compose 里 depends_on: service_healthy 的
+# web 就永远起不来 —— 一个探针把整套部署卡死（这条断言真的抓到过一次）。
+check("服务令牌不带 user_id 的存活探针 → 200", r.status_code, 200)
+check("探针不返回按用户的计数（也就不会做无归属查询）", r.json().get("counts"), None)
+
+r = c.get(f"{API}/health", params={"user_id": "someone"}, headers=H)
+check("服务令牌带 user_id → 200", r.status_code, 200)
+check_true("带了 user_id 就有计数", isinstance(r.json().get("counts"), dict), str(r.json().get("counts")))
+
 r = c.get(f"{API}/me", headers=H)
 check("服务令牌 /api/me → 200", r.status_code, 200)
 check("服务令牌的 scope", r.json().get("scope"), "service")
@@ -138,7 +148,7 @@ check("用户令牌签发验证码 → 403", r.status_code, 403)
 # ---------------------------------------------------------------------------
 print("\n--- 4. 一次性语义 ---")
 r = c.post(f"{API}/register", json={"qq": QQ_NEW, "code": code, "invite_code": new_invite()})
-check("验证码用过即废 → 401", r.status_code, 401)
+check("验证码用过即废 → 400", r.status_code, 400)
 
 inv = new_invite(max_uses=1)
 code_a = ask_code(QQ_BRUTE)
@@ -159,10 +169,15 @@ statuses = []
 for _ in range(6):
     r = c.post(f"{API}/register", json={"qq": QQ_GUESS, "code": wrong, "invite_code": new_invite()})
     statuses.append(r.status_code)
-check_true("猜错一律 401", all(s == 401 for s in statuses), str(statuses))
+check_true(
+    "猜错一律 400（刻意不是 401：注册是公开接口，而 401 会被前端的全局拦截器"
+    "当成「登录过期」把人弹回登录页，可他本来就没有令牌可清）",
+    all(s == 400 for s in statuses),
+    str(statuses),
+)
 
 r = c.post(f"{API}/register", json={"qq": QQ_GUESS, "code": real, "invite_code": new_invite()})
-check("超过尝试上限后，**连对的验证码也不认** → 401", r.status_code, 401)
+check("超过尝试上限后，**连对的验证码也不认** → 400", r.status_code, 400)
 
 # ---------------------------------------------------------------------------
 print("\n--- 6. 轮换令牌（丢了令牌的唯一出路） ---")

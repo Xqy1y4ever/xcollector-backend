@@ -1,11 +1,17 @@
 # Xcollector Backend
 
 Xcollector 的**数据层**：把 QQ 群里收到的官方通知存下来，并提供一套 HTTP 接口给
-bot 写入、给网页读取。
+bot 写入、给每个用户读取自己的那一份。
 
 它不做任何业务判断 —— 「什么是通知」「截止时间对不对」由
 [`xcollector-bot`](https://github.com/Xqy1y4ever/xcollector-bot) 决定。后端只负责存、查、
 和把**人工修正过的视图**读回去。
+
+> **多用户服务**：每个用户在 QQ 里给机器人发 `/注册` 拿验证码，到网页上注册，
+> 拿到一个只属于他自己的 `UserToken`。他订阅哪些「某个群里**某个人**说的话」
+> 由他自己配；bot 处理所有订阅的**并集**，抽一次，再把结果扇给每个订阅者。
+> 数据按 `user_id` 隔离，而且这条规则有自检脚本守着
+> （`tests/check_scoping_guard.py`：任何碰了用户表的查询没有 `user_id` 就直接抛异常）。
 
 > **项目主页与部署入口在
 > [`xcollector-deploy`](https://github.com/Xqy1y4ever/xcollector-deploy)**
@@ -55,7 +61,7 @@ QQ / NapCat ──OneBot──▶ xcollector-bot ──HTTP /api/*──▶ xcol
 ```bash
 git clone https://github.com/Xqy1y4ever/xcollector-deploy.git
 cd xcollector-deploy
-cp .env.example .env     # 填 API_TOKEN / WEB_API_TOKEN / 群白名单
+cp .env.example .env     # 填 API_TOKEN / SIGNUP_MODE / 群白名单
 sh preflight.sh          # 预检：端口、配置、镜像
 docker compose up -d
 ```
@@ -84,8 +90,11 @@ python -m app.main
 
 | 配置 | 默认 | 说明 |
 |---|---|---|
-| `API_TOKEN` | 空 | **写入令牌**。本地开发可留空（不校验） |
-| `WEB_API_TOKEN` | 空 | **网页令牌**。留空则与写入令牌相同（不区分权限） |
+| `API_TOKEN` | 空 | **服务令牌**。只有 bot 有；本地开发可留空（不校验） |
+| `SIGNUP_MODE` | `invite` | 谁能注册：`invite`（要邀请码）/ `open`（谁都能注册） |
+| `VERIFY_CODE_TTL` | `600` | QQ 验证码有效期（秒） |
+| `VERIFY_MAX_ATTEMPTS` | `5` | 验证码猜错几次作废 |
+| `ALLOW_TOKEN_ROTATION` | `true` | 允许已注册用户自助换一个新 UserToken |
 | `DB_PATH` | `data/xcollector.db` | SQLite 路径 |
 | `ATTACHMENT_DIR` | `data/attachments` | 附件目录 |
 | `MEDIA_MAX_BYTES` | `5242880` | 单个附件上限，超限返回 413 |
@@ -95,9 +104,21 @@ python -m app.main
 | `ATTACHMENT_SIGN_KEY` | 空 | 附件签名密钥，留空则从 `API_TOKEN` 派生 |
 | `LOG_LEVEL` / `LOG_PREVIEW_CHARS` | `INFO` / `60` | 日志 |
 
-**权限**：`API_TOKEN` 是写入令牌（入库、改机器字段、删除）；`WEB_API_TOKEN`
-是给网页登录页用的，只能读、提交人工修正、标记已读。范围不够返回 `403`，
-令牌不对返回 `401`。两个令牌相同就等同于没有区分。
+**身份有两种，而且不是"权限等级"**（见 [`docs/api.md`](docs/api.md) 的通用约定）：
+
+| 令牌 | 谁持有 | 能做什么 |
+|---|---|---|
+| `API_TOKEN` | **只有 bot** | 共享层全部；按用户的接口**必须显式带 `user_id`** |
+| `UserToken`（`xc_…`） | 每个用户自己 | 只能读写**他自己**的数据；`user_id` 参数被强制忽略 |
+
+**`UserToken` 不是配置项**：用户在 QQ 里给机器人发 `/注册` 拿到验证码，
+在网页上完成注册后由 `POST /api/register` 签发。明文只出现那一次
+（库里只存 sha256），丢了只能重复同样的流程再换一个。
+
+之所以不再有一个"网页令牌"：那是一个**共享密钥**，所有拿它的人看到的东西完全一样，
+既没有审计也没法单独吊销某个人。每人一个令牌之后，"隔离"这件事才第一次有了
+强制力 —— 后端对每个按用户的查询强制带 `user_id`，有自检脚本守着这条
+（`tests/check_scoping_guard.py`）。
 
 跟 QQ、白名单、抽取、摘要有关的配置**不在这里** —— 那些属于 bot，
 放在后端只会让人改了之后困惑为什么没生效。

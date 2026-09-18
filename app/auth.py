@@ -170,3 +170,19 @@ def resolve_owner(identity: Identity, requested: str | None) -> str:
             detail="服务令牌必须显式指定 user_id：这次请求要动谁的数据？",
         )
     return owner
+
+
+def resolve_owner_optional(identity: Identity, requested: str | None) -> str | None:
+    """和 `resolve_owner` 一样，但允许"这次请求不属于任何用户"。
+
+    只有**存活探针**（`GET /api/health`）用它。区别在于调用方拿到 `None` 之后
+    **必须真的不查任何用户数据**，而不是拿 None 去查（那会变成无归属查询）。
+
+    为什么需要：Dockerfile 的 HEALTHCHECK 只带 API_TOKEN 打 `/api/health`，
+    没有也拿不到 user_id。如果这里坚持要 user_id，容器会**永远不健康**，
+    compose 里 `depends_on: service_healthy` 的 web 就永远起不来 ——
+    一个探针把整套部署卡死。
+    """
+    if identity.is_user:
+        return resolve_owner(identity, requested)
+    return (requested or "").strip() or None

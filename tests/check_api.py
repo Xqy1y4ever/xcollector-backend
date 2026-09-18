@@ -43,7 +43,41 @@ TITLE_C = f"smokeC-{RUN}"
 BOT_STATE = f"state-{RUN}"
 
 H = {"Authorization": f"Bearer {TOKEN}"}
-c = httpx.Client(timeout=20)
+
+
+def _bootstrap_user() -> str:
+    """注册一个测试用户，返回 user_id。
+
+    多用户之后所有数据都要有归属，而**服务令牌必须显式指定 user_id**
+    （见 auth.resolve_owner）—— 所以这个脚本得先有一个用户，再让整个客户端
+    默认带上它。用一个临时 client 走注册流程，因为它自己也需要令牌。
+    """
+    qq = str(300000000 + int(RUN[-8:]) % 90000000)
+    boot = httpx.Client(timeout=20)
+    try:
+        r = boot.post(f"{API}/verify/request", json={"qq": qq}, headers=H)
+        r.raise_for_status()
+        code = r.json()["code"]
+        r = boot.post(
+            f"{API}/invites", json={"note": f"smoke-{RUN}", "max_uses": 1}, headers=H
+        )
+        r.raise_for_status()
+        invite = r.json()["code"]
+        r = boot.post(
+            f"{API}/register", json={"qq": qq, "code": code, "invite_code": invite}
+        )
+        r.raise_for_status()
+        return str(r.json()["user"]["id"])
+    finally:
+        boot.close()
+
+
+TEST_UID = os.environ.get("SMOKE_USER_ID") or _bootstrap_user()
+
+# 关键的一行：整个客户端的每个请求都自动带 `user_id=TEST_UID`。
+# httpx 会把 client.params 和请求自己的 params 合并（同名以请求为准），
+# 所以下面 60 多处 `params={...}` 一个字都不用改。
+c = httpx.Client(timeout=20, params={"user_id": TEST_UID})
 fails: list[str] = []
 total = 0
 
@@ -185,14 +219,24 @@ check("state 已改", row.get("state") == BOT_STATE, str(row.get("state")))
 check(
     "state_reason 已改", row.get("state_reason") == "bot 自己定义的原因", str(row.get("state_reason"))
 )
-# 附件 url 现在是**读时现签**的（带 exp+sig），因为浏览器 <img> 带不了 Authorization 头。
-# 所以这里断言的形状是：id/type 原样保留，url 指向同一个附件且**确实带了签名**。
+# 附件 url 在**读投影**里是读时现签的（带 exp+sig），因为浏览器 <img> 带不了
+# Authorization 头。但这里是**共享层**（`PATCH /api/messages/{id}`）：原始消息
+# 没有 owner 可以绑，所以它诚实地返回**裸路径**。
+#
+# 以前这里会签出一条 `?exp=..&u=&sig=..` —— 而校验侧要求 u 非空，那条链接
+# **永远 401**，还长得完全正常（有 exp 有 sig）。所以这条断言现在守的是
+# "别再造出那种用不了的签名"。
 _atts = row.get("attachments") or []
 check("attachments 事后补齐（1 个）", len(_atts) == 1, str(_atts))
 check("附件 id/type 原样保留", _atts and _atts[0].get("id") == "att_demo" and _atts[0].get("type") == "image", str(_atts))
 check(
-    "附件 url 已签名且指向同一附件",
-    bool(_atts) and "/api/attachments/att_demo" in str(_atts[0].get("url")) and "sig=" in str(_atts[0].get("url")),
+    "附件 url（共享层）是裸路径且指向同一附件",
+    bool(_atts) and str(_atts[0].get("url")) == "/api/attachments/att_demo",
+    str(_atts[0].get("url") if _atts else None),
+)
+check(
+    "共享层**不**伪造签名（空 u 的签名永远验不过）",
+    bool(_atts) and "sig=" not in str(_atts[0].get("url")) and "u=" not in str(_atts[0].get("url")),
     str(_atts[0].get("url") if _atts else None),
 )
 check("content 传了也没被改", row.get("content") == "正文：冒烟测试", str(row.get("content"))[:60])
@@ -349,7 +393,19 @@ check("修正不存在的通知 → 404", r.status_code == 404, f"HTTP {r.status
 r = c.get(f"{API}/notifications/{nid_a}/corrections", headers=H)
 corr = r.json().get("corrections", [])
 check("修正历史按时间正序（5 条）", [x["field"] for x in corr] == ["due_at", "status", "title", "location", "due_text"], str([x["field"] for x in corr]))
-check("修正历史带 user_id/ts", corr and corr[0]["user_id"] == "smoke" and isinstance(corr[0]["ts"], int), str(corr[:1])[:200])
+# 多用户之后 correction 有两个身份字段，别混：
+#   user_id 租户（这条修正属于谁的数据）
+#   actor   谁操作的（界面上显示"谁改的"）
+check(
+    "修正历史带 actor/ts（操作者）",
+    corr and corr[0]["actor"] == "web" and isinstance(corr[0]["ts"], int),
+    str(corr[:1])[:200],
+)
+check(
+    "修正历史属于正确的租户",
+    corr and corr[0].get("user_id") is None,  # 接口不回传租户，避免多余暴露
+    str(corr[:1])[:200],
+)
 
 # ---------------------------------------------------------------------------
 # 6. PATCH /notifications：允许改机器字段，忽略 status / read
@@ -549,7 +605,17 @@ check("digest-log count_only=1", set((r.json() or {}).keys()) == {"count"}, r.te
 check("count_only 计数为 1（幂等）", r.json().get("count") == 1, r.text[:120])
 r = c.get(f"{API}/digest-log", params={"kind": kind}, headers=H)
 logs = r.json().get("logs", [])
-check("列表按 ts 倒序、字段齐全", len(logs) == 2 and set(logs[0]) == {"id", "day", "kind", "text", "sent", "error", "ts"}, r.text[:240])
+check(
+    "列表按 ts 倒序、字段齐全",
+    len(logs) == 2
+    and set(logs[0]) == {"id", "user_id", "day", "kind", "text", "sent", "error", "ts"},
+    r.text[:240],
+)
+check(
+    "摘要记录带归属用户（多用户下必须按人分开）",
+    len(logs) == 2 and logs[0]["user_id"] == TEST_UID,
+    str(logs[:1])[:200],
+)
 check("sent 以 bool 返回", logs[0].get("sent") is False and logs[1].get("sent") is True, str([x["sent"] for x in logs]))
 check("day 省略 → 服务器当天", logs[0].get("day") == day, str(logs[0].get("day")))
 r = c.get(f"{API}/digest-log", params={"day": day, "kind": kind, "sent": "false", "count_only": "1"}, headers=H)

@@ -27,9 +27,15 @@ CORRECTABLE_FIELDS = ("title", "summary", "location", "due_at", "due_text", "sta
 
 def _latest_id(field: str) -> str:
     """该通知该字段是否存在人工修正（NULL 既可能是"没改过"也可能是"改成 NULL"，
-    所以要单独取一次 id 来区分）。"""
+    所以要单独取一次 id 来区分）。
+
+    子查询里 `c.user_id = n.user_id` **不能省**：correction 是用户表，
+    少这个条件就可能把别人的修正读进来 —— 而新通知恰好没有修正时，
+    这个 bug 是看不出来的。
+    """
     return (
         "(SELECT c.id FROM correction c WHERE c.notification_id = n.id"
+        " AND c.user_id = n.user_id"
         f" AND c.field = '{field}' ORDER BY c.ts DESC, c.id DESC LIMIT 1)"
     )
 
@@ -37,6 +43,7 @@ def _latest_id(field: str) -> str:
 def _latest_value(field: str) -> str:
     return (
         "(SELECT c.value FROM correction c WHERE c.notification_id = n.id"
+        " AND c.user_id = n.user_id"
         f" AND c.field = '{field}' ORDER BY c.ts DESC, c.id DESC LIMIT 1)"
     )
 
@@ -66,6 +73,7 @@ def _projection_sql(now: int | None = None) -> str:
 WITH proj AS (
   SELECT
     n.id                                          AS id,
+    n.user_id                                     AS user_id,
     n.group_id                                    AS group_id,
     n.group_name                                  AS group_name,
     n.sender_id                                   AS sender_id,
@@ -85,9 +93,11 @@ WITH proj AS (
     n.candidates                                  AS candidates,
     n.evidence                                    AS evidence,
     {_status_sql(moment)}                         AS status,
-    (SELECT COUNT(*) FROM correction c WHERE c.notification_id = n.id)
+    (SELECT COUNT(*) FROM correction c WHERE c.notification_id = n.id
+                                             AND c.user_id = n.user_id)
                                                   AS correction_count,
-    (SELECT rs.read_at FROM read_state rs WHERE rs.notification_id = n.id)
+    (SELECT rs.read_at FROM read_state rs WHERE rs.notification_id = n.id
+                                             AND rs.user_id = n.user_id)
                                                   AS read_at,
     n.extractor                                   AS extractor,
     n.model                                       AS model,
@@ -115,14 +125,16 @@ def like_pattern(needle: str) -> str:
 
 
 def _notification_where(
+    user_id: str,
     *,
     notif_id: str | None = None,
     since: int | None = None,
     status: str | None = None,
     q: str | None = None,
 ) -> tuple[str, list[Any]]:
-    clauses: list[str] = []
-    params: list[Any] = []
+    # user_id 是**必需**条件，放最前面，且不参与"要不要加 WHERE"的判断
+    clauses: list[str] = ["user_id = ?"]
+    params: list[Any] = [user_id]
     if notif_id is not None:
         clauses.append("id = ?")
         params.append(notif_id)
@@ -140,18 +152,18 @@ def _notification_where(
             f" OR evidence LIKE ? ESCAPE '{_LIKE_ESCAPE}')"
         )
         params.extend([pattern, pattern, pattern])
-    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
-    return where, params
+    return " WHERE " + " AND ".join(clauses), params
 
 
 async def list_notification_views(
+    user_id: str,
     *,
     since: int | None = None,
     status: str = "all",
     q: str | None = None,
     limit: int = 500,
 ) -> list[dict]:
-    where, params = _notification_where(since=since, status=status, q=q)
+    where, params = _notification_where(user_id, since=since, status=status, q=q)
     sql = (
         _projection_sql()
         + f"SELECT * FROM proj{where}"
@@ -162,17 +174,18 @@ async def list_notification_views(
 
 
 async def count_notification_views(
+    user_id: str,
     *,
     since: int | None = None,
     status: str = "all",
     q: str | None = None,
 ) -> int:
-    where, params = _notification_where(since=since, status=status, q=q)
+    where, params = _notification_where(user_id, since=since, status=status, q=q)
     return await count_of(_projection_sql() + f"SELECT COUNT(*) AS c FROM proj{where}", params)
 
 
-async def get_notification_view(notif_id: str) -> dict | None:
-    where, params = _notification_where(notif_id=notif_id)
+async def get_notification_view(user_id: str, notif_id: str) -> dict | None:
+    where, params = _notification_where(user_id, notif_id=notif_id)
     row = await fetch_one(_projection_sql() + f"SELECT * FROM proj{where}", params)
     return to_view(row) if row else None
 
@@ -197,7 +210,7 @@ def to_view(row: dict) -> dict:
         "status": row.get("status"),
         "manually_edited": bool(row.get("correction_count")),
         "read": row.get("read_at") is not None,
-        "attachments": sign_attachments(json_loads(row.get("raw_attachments"), [])),
+        "attachments": sign_attachments(str(row["user_id"]), json_loads(row.get("raw_attachments"), [])),
         "extractor": row.get("extractor"),
         "model": row.get("model"),
         "prompt_ver": row.get("prompt_ver"),
@@ -236,8 +249,12 @@ VIEW_FIELDS = (
 )
 
 
-def raw_view(row: dict | None) -> dict | None:
-    """raw_message 行的对外形状（含 content / attachments / raw / state）。"""
+def raw_view(row: dict | None, user_id: str = "") -> dict | None:
+    """raw_message 行的对外形状（含 content / attachments / raw / state）。
+
+    `user_id` 只用来签附件链接 —— raw_message 本身是**共享**的（它属于所有
+    订阅了这条消息的人），但附件链接必须只对请求者有效。
+    """
     if row is None:
         return None
     return {
@@ -249,7 +266,7 @@ def raw_view(row: dict | None) -> dict | None:
         "sender_name": row.get("sender_name"),
         "ts": row.get("ts"),
         "content": row.get("content") or "",
-        "attachments": sign_attachments(json_loads(row.get("attachments"), [])),
+        "attachments": sign_attachments(user_id, json_loads(row.get("attachments"), [])),
         "raw": json_loads(row.get("raw"), {}),
         "ingested_at": row.get("ingested_at"),
         "state": row.get("state"),
@@ -258,5 +275,5 @@ def raw_view(row: dict | None) -> dict | None:
     }
 
 
-def raw_views(rows: Sequence[dict]) -> list[dict]:
-    return [raw_view(row) for row in rows]
+def raw_views(rows: Sequence[dict], user_id: str = "") -> list[dict]:
+    return [raw_view(row, user_id) for row in rows]

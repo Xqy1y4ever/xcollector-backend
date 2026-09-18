@@ -276,10 +276,16 @@ async def register_or_rotate(
         await _check_invite_usable(invite_code)
 
     # 2) 证明 QQ 归属
+    #
+    # 验证码不对 → **400，不是 401**。这个接口是**公开**的（注册的前提就是还没有
+    # 令牌），而 401 在 HTTP 里有固定含义："你的凭据缺失或无效"。前端的全局
+    # 拦截器一律把 401 当成"登录过期"→ 清令牌 + 跳登录页 —— 那会让用户在
+    # 注册页上填错一个数字就被弹回登录页，而且他本来就没有令牌可清。
+    # 内容填错了是 400 的语义。
     if not await verify_code_matches(qq, code):
         raise UserError(
             "验证码不对或已过期。请在 QQ 上给机器人发一条消息重新获取。",
-            status_code=401,
+            status_code=400,
         )
 
     # 3) 验证码通过之后才真正消耗邀请码
