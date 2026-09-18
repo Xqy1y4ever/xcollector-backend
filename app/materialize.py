@@ -103,6 +103,11 @@ WITH proj AS (
     n.model                                       AS model,
     n.prompt_ver                                  AS prompt_ver,
     n.source_ts                                   AS source_ts,
+    -- raw_message_id 也透出来：入库客户端要靠它建"这条源消息我处理过"的集合。
+    -- 游标丢了之后，这个集合能让客户端**跳过重新抽取**（也就是不重复花模型的
+    -- 钱）；而共享层的读是服务令牌专属的，用户令牌下没有别的办法拿到 raw id。
+    -- 它是这条通知自己的字段，不泄露任何别人的东西。
+    n.raw_message_id                              AS raw_message_id,
     n.created_at                                  AS created_at,
     n.updated_at                                  AS updated_at,
     r.attachments                                 AS raw_attachments
@@ -215,6 +220,8 @@ def to_view(row: dict) -> dict:
         "model": row.get("model"),
         "prompt_ver": row.get("prompt_ver"),
         "source_ts": row.get("source_ts"),
+        # 入库客户端用它建"我处理过哪些源消息"的集合（见上面 SELECT 里的说明）
+        "raw_message_id": row.get("raw_message_id"),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -244,6 +251,7 @@ VIEW_FIELDS = (
     "model",
     "prompt_ver",
     "source_ts",
+    "raw_message_id",
     "created_at",
     "updated_at",
 )

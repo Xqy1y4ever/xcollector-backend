@@ -34,22 +34,29 @@ bot 写入、给每个用户读取自己的那一份。
 ## 架构
 
 ```
-QQ / NapCat ──OneBot──▶ xcollector-bot ──HTTP /api/*──▶ xcollector-backend
-                                                              ▲
-                                        xcollector-web ────────┘
-                                        （前端只跟后端打交道）
+QQ / NapCat ──OneBot──▶ xcollector-bot ──┐
+                                         │  HTTP /api/*
+nt_msg_export.db ──▶ xcollector-client ──┼──▶ xcollector-backend
+                                         │            ▲
+                        xcollector-web ──┴────────────┘
+                        （前端只跟后端打交道）
 ```
 
-| 属于后端 | 属于 bot |
+| 属于后端 | 属于入库方（bot / client） |
 |---|---|
-| 存储与表结构 | 连 OneBot / NapCat |
-| 增删查改接口 | 群与发送者筛选 |
+| 存储与表结构 | 连 OneBot（只有 bot）或读聊天记录库（client） |
+| 增删查改接口 | 群与发送者筛选、按订阅过滤 |
 | 读投影：人工修正覆盖机器字段、由截止时间推导状态 | 抽取（规则 + 大模型） |
 | 附件二进制存取 | 缺口检测、每日摘要、私聊指令 |
 | 幂等与唯一性约束 | 统计计数 |
 
 前端需要的数据全部从后端取；「系统状态」页那部分运行时信息由 bot 提供
-（见 `docs/api.md` 第 9 节）。
+（见 `docs/api.md` 第 9 节，它只认管理令牌）。
+
+> **两条入库链路任选一条**（同一个 QQ 账号不要同时开，会重复入库 —— 两边的
+> `message_id` 格式不同，幂等键拦不住）：bot 连 OneBot 实时入库；client 读一份
+> 聊天记录库、用用户自己的 UserToken 入库，**不连 QQ**。只想用 client 的话，
+> 把 bot 的群/发送者白名单留空，它仍然负责 `/注册`、`/订阅`、摘要推送。
 
 ## 部署
 

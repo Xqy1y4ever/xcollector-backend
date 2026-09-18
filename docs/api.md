@@ -323,7 +323,14 @@ Query：
 | `read` | 是否已读 |
 | `attachments` | 从对应的 `raw_message` 取 |
 | `extractor` / `model` / `prompt_ver` | 溯源 |
+| `raw_message_id` | 对应的原始消息 id（见下面的说明） |
 | `source_ts` / `created_at` / `updated_at` | 时间 |
+
+> **`raw_message_id` 是给入库客户端用的**：它靠这个字段建"这条源消息我处理过"的
+> 集合，于是在游标丢失后重扫时能**跳过重新抽取**（不重复花模型的钱）。
+> 共享层的读是服务令牌专属的，用户令牌下没有别的办法拿到 raw id。
+> 它是这条通知自己的字段，不泄露任何别人的东西 —— 但**别指望**用它去反查共享层，
+> 那条路对用户令牌是封死的（见「谁能写什么」）。
 
 ### `GET /api/notifications/{id}`
 
