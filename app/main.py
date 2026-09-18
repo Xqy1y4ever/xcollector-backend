@@ -18,7 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from . import __version__
-from .api import open_router, router
+from .api import open_router, public_router, router
 from .config import get_settings
 from .db import close_db, init_db
 from .logging_setup import setup_logging
@@ -36,16 +36,12 @@ async def lifespan(app: FastAPI):
     logger.info("附件目录：%s（单文件上限 %d 字节）", settings.resolved_attachment_dir, settings.media_max_bytes)
     if settings.auth_enabled:
         logger.info("认证已开启：所有 /api 请求都需要 Bearer 令牌")
-        if settings.web_scope_separated:
-            logger.info(
-                "网页令牌已分离：WEB_API_TOKEN 只能读 + 人工修正 + 标已读，"
-                "写接口（入库/建条/改机器字段/删除）只认 API_TOKEN"
-            )
-        else:
-            logger.warning(
-                "WEB_API_TOKEN 未配置（或与 API_TOKEN 相同）：网页令牌拥有**完整写入权限**，"
-                "分级没有生效。想让网页只能读+标注，请单独设一个不同的 WEB_API_TOKEN。"
-            )
+        logger.info(
+            "注册方式：%s",
+            "需要邀请码（用 API_TOKEN 调 POST /api/invites 签发）"
+            if settings.signups_require_invite
+            else "**开放注册** —— 任何能通过 QQ 验证的人都能注册",
+        )
         if settings.attachment_url_ttl <= 0:
             logger.warning(
                 "ATTACHMENT_URL_TTL <= 0：附件 URL 不做签名，浏览器 <img> 取附件会 401"
@@ -76,6 +72,8 @@ app.include_router(router)
 # 附件下载单独挂：它允许不带 Authorization 头（改由签名 URL 判断），
 # 所以不能带上那个"全 router 都要 Bearer"的依赖。见 routes.py 的 require_download。
 app.include_router(open_router)
+# 注册单独挂：它的前提就是"还没有令牌"，所以必须在鉴权之外。
+app.include_router(public_router)
 
 
 @app.get("/")

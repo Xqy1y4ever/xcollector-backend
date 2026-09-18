@@ -171,6 +171,44 @@ CREATE TABLE IF NOT EXISTS bot_state (
   PRIMARY KEY (namespace, "key")
 );
 CREATE INDEX IF NOT EXISTS ix_state_expires ON bot_state(expires_at);
+
+-- ==================== 用户与注册 ====================
+-- 多用户服务的地基。三张表各管一件事：
+--   app_user          谁是用户、他的令牌是什么
+--   invite_code       谁能注册（邀请码/审批制，见 config.signup_mode）
+--   qq_verify_code    「这个 QQ 确实是你的」怎么证明
+--
+-- **令牌只存 sha256**：库被拿走也不等于所有人的令牌被拿走。代价是令牌只能
+-- 在注册/重置那一次显示给用户，之后再也拿不回来（和 API key 一个道理）。
+CREATE TABLE IF NOT EXISTS app_user (
+  id           TEXT PRIMARY KEY,             -- usr_xxx
+  qq           TEXT NOT NULL UNIQUE,         -- 身份锚点：注册、找回令牌都靠它
+  display_name TEXT,
+  token_hash   TEXT NOT NULL,                -- UserToken 的 sha256（不存明文）
+  token_hint   TEXT NOT NULL DEFAULT '',     -- 令牌前 8 位，只用来让用户认出是哪一个
+  status       TEXT NOT NULL DEFAULT 'active',  -- active / disabled
+  created_at   INTEGER NOT NULL,
+  last_seen_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_user_status ON app_user(status);
+
+CREATE TABLE IF NOT EXISTS invite_code (
+  code       TEXT PRIMARY KEY,
+  note       TEXT,                           -- 发给谁用的，纯备注
+  max_uses   INTEGER NOT NULL DEFAULT 1,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER,                        -- NULL = 不过期
+  created_at INTEGER NOT NULL
+);
+
+-- 一个 QQ 同时只留一个待用验证码（重新申请就覆盖旧的）
+CREATE TABLE IF NOT EXISTS qq_verify_code (
+  qq         TEXT PRIMARY KEY,
+  code       TEXT NOT NULL,
+  expires_at INTEGER NOT NULL,
+  attempts   INTEGER NOT NULL DEFAULT 0,     -- 猜错次数，超上限直接作废
+  created_at INTEGER NOT NULL
+);
 """
 
 _conn: aiosqlite.Connection | None = None

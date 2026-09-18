@@ -26,7 +26,14 @@ from ..attachments import (
     handle_upload,
     load_bytes,
 )
-from ..auth import Scope, optional_token, require_token, require_write
+from ..auth import (
+    Identity,
+    optional_token,
+    require_service,
+    require_token,
+    require_user,
+    resolve_owner,
+)
 from ..config import get_settings
 from ..signing import verify_attachment_sig
 from ..db import (
@@ -71,6 +78,17 @@ from ..materialize import (
     raw_view,
     raw_views,
 )
+from ..users import (
+    UserError,
+    count_users,
+    create_invite,
+    get_user_by_id,
+    issue_verify_code,
+    list_invites,
+    list_users,
+    public_user,
+    register_or_rotate,
+)
 from ..utils import as_int, json_loads, now_ms, preview
 
 logger = logging.getLogger(__name__)
@@ -84,19 +102,22 @@ _FALSE = {"0", "false", "no", "off", "f", ""}
 
 # --------------------------------------------------------------------------
 # 认证：见 auth.py。所有 /api 请求都要带 Authorization: Bearer <令牌>，
-# 而**写接口**另外要求那是写入令牌（只有 bot 有）。
+# 而**写接口**另外要求那是服务令牌（只有 bot 有）。
 #
-# 两个 router：
-#   router       要 Bearer（默认，绝大多数接口）
-#   open_router  不要 Bearer，自己判断"签名 URL 或 Bearer"—— 只放附件下载，
-#                因为浏览器 <img> / <a> 带不了 Authorization 头。
+# 三个 router：
+#   router        要 Bearer（默认，绝大多数接口）
+#   open_router   不要 Bearer，自己判断"签名 URL 或 Bearer"—— 只放附件下载，
+#                 因为浏览器 <img> / <a> 带不了 Authorization 头。
+#   public_router 完全不鉴权 —— 只放**注册**。注册的前提就是"还没有令牌"，
+#                 所以它天然必须在鉴权之外；安全性由邀请码 + QQ 验证码担着。
 # --------------------------------------------------------------------------
 
 router = APIRouter(prefix="/api", dependencies=[Depends(require_token)])
 open_router = APIRouter(prefix="/api")
+public_router = APIRouter(prefix="/api")
 
-# 写接口统一挂这个：网页令牌调会得到 403 而不是 401（身份有效但没权限）
-WriteDep = Depends(require_write)
+# 写接口统一挂这个：只有服务令牌（bot）能过
+WriteDep = Depends(require_service)
 
 
 # --------------------------------------------------------------------------
@@ -496,7 +517,7 @@ async def require_download(
     att_id: str,
     exp: Annotated[str | None, Query()] = None,
     sig: Annotated[str | None, Query()] = None,
-    scope: Annotated[Scope | None, Depends(optional_token)] = None,
+    identity: Annotated[Identity | None, Depends(optional_token)] = None,
 ) -> None:
     """附件下载的鉴权：**有效签名 URL 或有效 Bearer 令牌**，任一即可。
 
@@ -506,13 +527,16 @@ async def require_download(
 
     三条放行路径：
       1. 没配 API_TOKEN（本地开发）—— 与其它接口一致，不校验
-      2. 带了有效 Bearer（bot、curl 调试走这条）
+      2. 带了有效 Bearer
       3. `exp` + `sig` 签名有效且未过期
     都不满足 → 401。
+
+    ⚠️ 多用户下签名**必须绑定 user_id**（Phase 2）—— 否则拿到别人通知里的
+    链接就能看别人的附件。当前签名还没绑，见 signing.py 的 TODO。
     """
     if not get_settings().auth_enabled:
         return
-    if scope is not None:
+    if identity is not None:
         return
     if verify_attachment_sig(att_id, exp, sig):
         return
@@ -540,6 +564,121 @@ async def download_attachment(att_id: str, _: None = Depends(require_download)):
             "X-Content-Type-Options": "nosniff",
         },
     )
+
+
+# --------------------------------------------------------------------------
+# 3b. 用户、注册、邀请码
+# --------------------------------------------------------------------------
+
+# ⚠️ 这一节是**鉴权之外**的唯一入口（`/api/register` 挂在 public_router 上）。
+# 它的安全完全由三样东西担着：邀请码、QQ 验证码（bot 只发给能收到它消息的人）、
+# 以及猜错次数上限。改动这里之前先想清楚这三点还在不在。
+
+
+class VerifyRequestBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    qq: str
+
+
+@router.post("/verify/request", dependencies=[WriteDep])
+async def request_verify_code(body: VerifyRequestBody):
+    """给某个 QQ 生成验证码。
+
+    **只允许服务令牌（bot）调**。原因：如果谁能调，他就能一直刷新别人的验证码，
+    把真正的主人挡在门外（拒绝服务），也把 6 位码的猜测窗口拉长。
+
+    bot 拿到码之后**自己用 QQ 私聊发给对方** —— 这是整条链路的信任基础：
+    只有能收到那条私聊的人，才证明得了自己拥有这个 QQ 号。
+    """
+    try:
+        issued = await issue_verify_code(body.qq)
+    except UserError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+    logger.info("签发验证码 qq=%s", issued["qq"])
+    return issued
+
+
+class RegisterBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    qq: str
+    code: str
+    invite_code: str | None = None
+    display_name: str | None = None
+
+
+@public_router.post("/register")
+async def register(body: RegisterBody):
+    """注册新用户，或给已有用户**轮换令牌**。
+
+    **不需要任何令牌**（注册的前提就是还没有），靠邀请码 + QQ 验证码把关。
+
+    返回值里的 `token` 是**明文令牌，只会出现这一次** —— 库里只存 sha256。
+    前端必须让用户当场复制走，并明确告诉他丢了只能用同样的流程再换一个。
+    """
+    try:
+        user, token, created = await register_or_rotate(
+            qq=body.qq,
+            code=body.code,
+            invite_code=body.invite_code,
+            display_name=body.display_name,
+        )
+    except UserError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.detail)
+
+    return {
+        "user": public_user(user),
+        "token": token,
+        "created": created,
+        "notice": (
+            "这个令牌只会显示这一次，请立刻保存。它同时是你的登录凭证和调用凭证。"
+            "丢了可以用同样的方式（QQ 找机器人要验证码）再换一个。"
+        ),
+    }
+
+
+@router.get("/me")
+async def whoami(identity: Annotated[Identity, Depends(require_token)]):
+    """我是谁。前端登录后第一件事就是调它 —— 令牌对不对一次就知道。"""
+    if identity.is_service:
+        return {"scope": "service", "user": None}
+    user = await get_user_by_id(identity.user_id or "")
+    if user is None:
+        raise HTTPException(status_code=401, detail="令牌无效")
+    return {"scope": "user", "user": public_user(user)}
+
+
+class InviteBody(BaseModel):
+    model_config = ConfigDict(extra="ignore")
+
+    note: str | None = None
+    max_uses: int = 1
+    ttl_seconds: int | None = None
+
+
+@router.post("/invites", dependencies=[WriteDep])
+async def create_invite_route(body: InviteBody):
+    """发一个邀请码。**只有服务令牌能发** —— 它就是"谁能注册"的开关。
+
+    运营者用 API_TOKEN 调它（curl 或前端的管理入口），把 code 发给要邀请的人。
+    """
+    invite = await create_invite(
+        note=body.note, max_uses=body.max_uses, ttl_seconds=body.ttl_seconds
+    )
+    logger.info("签发邀请码 code=%s note=%s max_uses=%s", invite["code"], body.note, invite["max_uses"])
+    return invite
+
+
+@router.get("/invites", dependencies=[WriteDep])
+async def list_invites_route():
+    return {"invites": await list_invites()}
+
+
+@router.get("/users", dependencies=[WriteDep])
+async def list_users_route():
+    """所有用户。**不发令牌、不发摘要**，只是名单。"""
+    return {"users": await list_users(), "count": await count_users()}
 
 
 # --------------------------------------------------------------------------

@@ -1,69 +1,64 @@
-"""鉴权：令牌 → 范围（scope）。
+"""鉴权：令牌 → 身份。
 
-**为什么分范围**：整套系统原来只有一个共享密钥，而它必须交给登录页 ——
-于是任何能打开网页、看一眼浏览器存储的人都能调**所有**写接口：伪造入库、
-改机器字段、删通知。但网页实际上只需要"看 + 人工修正 + 标已读"。
+**两个范围**：
 
-所以拆成两个令牌：
+    API_TOKEN    服务令牌 —— 只有 bot 有。能跨用户读写所有人的数据。
+                 所以它**绝不外传**，也不进浏览器。
+    UserToken    用户令牌 —— 每个用户注册时签发（见 users.py），绑定到具体的
+                 user_id，只能碰自己的数据。前端登录页输的就是它。
 
-    API_TOKEN       写入范围（write）—— 只有 bot 知道，**永远不进浏览器**
-    WEB_API_TOKEN   网页范围（web）  —— 登录页用，只读 + 那两个标注接口
+用户端点的归属判定规则（`resolve_owner`）：
 
-`WEB_API_TOKEN` 留空 = 退回单令牌模式（`API_TOKEN` 同时充当网页令牌），
-已有部署升级上来行为完全不变。
+    UserToken            → 归属就是它绑定的那个用户，**无视请求里的 user_id**
+                           （否则改个 query 参数就能读别人）
+    服务令牌 + user_id   → 用显式指定的用户（bot 发每日摘要时要按用户读）
 
-范围不够时返回 **403 而不是 401**：调用方身份是有效的，只是没这个权限 ——
-前端据此能区分"令牌错了，去重新登录"和"你没这个权限"。
+**绝不写「传了 `?user_id=` 就从用户令牌切走」** —— 那正是越权最常见的写法。
+服务令牌必须显式传；用户令牌传了也无效。
+
+范围不够返回 **403**（身份有效但没权限），令牌不对返回 **401**。前端据此区分
+"去重新登录"和"你没这个权限"。
 """
 
 from __future__ import annotations
 
 import logging
 import secrets
+from dataclasses import dataclass
 from enum import Enum
 from typing import Annotated
 
 from fastapi import Depends, Header, HTTPException
 
 from .config import get_settings
+from .users import get_user_by_token, touch_user
 
 logger = logging.getLogger(__name__)
 
-# 只在启动时提醒一次"两个令牌配成一样了"，不要每个请求都刷
-_warned_same_token = False
-
 
 class Scope(str, Enum):
-    WRITE = "write"
-    WEB = "web"
+    SERVICE = "service"
+    USER = "user"
 
 
-def resolve_scope(token: str) -> Scope | None:
-    """把令牌换成范围；不认识就返回 None。
+@dataclass(frozen=True)
+class Identity:
+    """一次请求的调用者。"""
 
-    两个令牌都**无条件比对**（不用 if/elif 短路），比对本身是定长的，
-    这样"令牌对不对"不会从响应时间上泄漏出去。
-    """
-    prepared = (token or "").strip()
-    if not prepared:
-        return None
+    scope: Scope
+    user_id: str | None = None
+    token: str = ""
 
-    settings = get_settings()
-    write_token = settings.api_token.strip()
-    # 网页令牌没配 = 单令牌模式：API_TOKEN 同时当网页令牌用
-    web_token = settings.web_api_token.strip() or write_token
+    @property
+    def is_service(self) -> bool:
+        return self.scope is Scope.SERVICE
 
-    if not write_token and not web_token:
-        return None
+    @property
+    def is_user(self) -> bool:
+        return self.scope is Scope.USER
 
-    is_write = bool(write_token) and secrets.compare_digest(prepared, write_token)
-    is_web = bool(web_token) and secrets.compare_digest(prepared, web_token)
 
-    if is_write:
-        return Scope.WRITE
-    if is_web:
-        return Scope.WEB
-    return None
+SERVICE = Identity(scope=Scope.SERVICE)
 
 
 def _parse_bearer(authorization: str | None) -> str:
@@ -75,28 +70,15 @@ def _parse_bearer(authorization: str | None) -> str:
 
 async def require_token(
     authorization: Annotated[str | None, Header()] = None,
-) -> Scope:
-    """所有 /api 接口的入口鉴权。返回调用方的范围。
+) -> Identity:
+    """所有 /api 接口的入口鉴权。
 
-    未配 `API_TOKEN` = 本地开发模式，**不校验**且按写入范围放行（启动时打过
+    未配 `API_TOKEN` = 本地开发模式，**不校验**且按服务令牌放行（启动时打过
     WARNING）。"忘了配"和"故意不配"在日志里必须能区分开。
     """
-    global _warned_same_token
-
     settings = get_settings()
     if not settings.auth_enabled:
-        return Scope.WRITE
-
-    if (
-        not _warned_same_token
-        and settings.web_api_token.strip()
-        and settings.web_api_token.strip() == settings.api_token.strip()
-    ):
-        _warned_same_token = True
-        logger.warning(
-            "WEB_API_TOKEN 与 API_TOKEN 相同：网页令牌因此拥有完整写入权限，"
-            "这次拆分等于没做。请给网页端换一个不同的令牌。"
-        )
+        return SERVICE
 
     token = _parse_bearer(authorization)
     if not token:
@@ -106,50 +88,85 @@ async def require_token(
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    scope = resolve_scope(token)
-    if scope is None:
+    # 服务令牌先比：定长比较，且不走用户表的查询路径
+    if secrets.compare_digest(token, settings.api_token.strip()):
+        return Identity(scope=Scope.SERVICE, token=token)
+
+    row = await get_user_by_token(token)
+    if row is None:
         raise HTTPException(
             status_code=401,
             detail="令牌无效",
             headers={"WWW-Authenticate": "Bearer"},
         )
-    return scope
+    await touch_user(str(row["id"]))
+    return Identity(scope=Scope.USER, user_id=str(row["id"]), token=token)
 
 
 async def optional_token(
     authorization: Annotated[str | None, Header()] = None,
-) -> Scope | None:
+) -> Identity | None:
     """像 `require_token`，但没带令牌时**返回 None 而不是抛**。
 
     只给附件下载用：那条路允许"没有 Authorization 头"，改由签名来判断。
     """
     settings = get_settings()
     if not settings.auth_enabled:
-        return Scope.WRITE
-    token = _parse_bearer(authorization)
-    if not token:
+        return SERVICE
+    if not _parse_bearer(authorization):
         return None
-    return resolve_scope(token)
+    try:
+        return await require_token(authorization)
+    except HTTPException:
+        return None
 
 
-async def require_write(
-    scope: Annotated[Scope, Depends(require_token)],
-) -> Scope:
-    """写接口的门槛：只有写入令牌能过。
+async def require_service(
+    identity: Annotated[Identity, Depends(require_token)],
+) -> Identity:
+    """只允许服务令牌（bot）调用的接口。
 
-    挂在这些接口上：入库（messages / notifications / attachments / groups /
-    gap-alerts / stats / digest-log / state）。
+    挂在这些上面：入库（messages / notifications / attachments / groups /
+    gap-alerts / stats / digest-log / state）、签发验证码、发邀请码。
 
-    **刻意不挂**在 `POST /notifications/{id}/corrections` 和
-    `POST /notifications/{id}/read` 上 —— 那两个是人工标注，网页必须能调，
-    而且 corrections 只追加、不覆盖机器字段。
+    **刻意不挂**在 `corrections` 和 `read` 上 —— 那是用户对自己条目的标注。
     """
-    if scope is not Scope.WRITE:
+    if not identity.is_service:
         raise HTTPException(
             status_code=403,
-            detail=(
-                "该接口只允许 bot 调用（需要写入令牌 API_TOKEN）。"
-                "网页令牌只能读取、提交人工修正、标记已读。"
-            ),
+            detail="该接口只允许服务端（bot）调用。用户令牌只能读写自己的数据。",
         )
-    return scope
+    return identity
+
+
+async def require_user(
+    identity: Annotated[Identity, Depends(require_token)],
+) -> Identity:
+    """只允许用户令牌调用的接口（自己的订阅、自己的资料）。"""
+    if not identity.is_user:
+        raise HTTPException(
+            status_code=403,
+            detail="该接口需要用户令牌（在登录页输入的那个）。",
+        )
+    return identity
+
+
+def resolve_owner(identity: Identity, requested: str | None) -> str:
+    """定出这次请求动的是**谁的数据**。
+
+    用户令牌 → 永远是自己（requested 被忽略，这正是关键）；
+    服务令牌 → 必须显式给 user_id：调用方没说清要动谁，就报错，
+               猜一个的后果比报错严重得多。
+    """
+    if identity.is_user:
+        if not identity.user_id:  # pragma: no cover - 构造上不可能
+            raise HTTPException(status_code=401, detail="令牌无效")
+        return identity.user_id
+
+    owner = (requested or "").strip()
+    if not owner:
+        raise HTTPException(
+            status_code=400,
+            detail="服务令牌必须显式指定 user_id：这次请求要动谁的数据？",
+        )
+    return owner

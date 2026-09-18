@@ -11,9 +11,9 @@
   4. 跨进程共享的密钥在两边**同名**
 
 第 4 条最容易出错，也最烦人：同一个值如果一边叫 A 一边叫 B，
-配置的人得靠猜才知道它们必须一致。整套系统现在有**两个**共享密钥：
-`API_TOKEN`（写入令牌，只有 bot 有）和 `WEB_API_TOKEN`（网页令牌，
-后端和 bot 都要认它）。两者都必须两边同名。
+配置的人得靠猜才知道它们必须一致。现在只剩**一个**共享密钥：`API_TOKEN`
+（服务令牌，只有 bot 有）。用户令牌不走配置 —— 每人注册时各自签发、
+绑定到自己的 user_id，所以没有"两边同名"这回事。
 
 bot 仓库不在旁边时，第 3、4 条会跳过（只校验本仓库）。
 """
@@ -42,12 +42,12 @@ BACKEND_ONLY = {
     "DB_PATH", "ATTACHMENT_DIR", "SERVER_HOST", "SERVER_PORT", "CORS_ORIGINS",
     # 附件签名 URL 是后端独有的：只有它对外提供附件字节
     "ATTACHMENT_URL_TTL", "ATTACHMENT_SIGN_KEY",
+    # 用户系统也是后端独有的：bot 只通过接口签发验证码，不读这些配置
+    "SIGNUP_MODE", "VERIFY_CODE_TTL", "VERIFY_MAX_ATTEMPTS", "ALLOW_TOKEN_ROTATION",
 }
-# 两边都必须同名：这两个都是"调用方带来的令牌"，一边改了另一边必须跟着改。
-#   API_TOKEN      写入令牌（bot 送去后端 / bot 自己 API 的管理令牌）
-#   WEB_API_TOKEN  网页令牌（后端和 bot 都要认它，才能只读+标注）
-# 配成同名的理由和 API_TOKEN 一样：不同名的话配置的人得靠猜才知道要一致。
-SHARED_MUST_MATCH = {"API_TOKEN", "WEB_API_TOKEN"}
+# 共享密钥只剩服务令牌一个。用户令牌（UserToken）不走配置 ——
+# 每人注册时各自签发、绑定到 user_id，没有"两边同名"这回事。
+SHARED_MUST_MATCH = {"API_TOKEN"}
 
 KEY_RE = re.compile(r"^\s*([A-Z][A-Z0-9_]*)\s*=", re.M)
 DECL_RE = re.compile(r"^\s*([a-z][a-z0-9_]*)\s*:\s*[^=\n]+=", re.M)
