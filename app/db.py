@@ -1371,6 +1371,31 @@ async def count_subscriptions(user_id: str, *, enabled_only: bool = False) -> in
     return await count_of(sql, (user_id,))
 
 
+async def has_subscription(
+    user_id: str, group_id: str, sender_id: str | None = None
+) -> bool:
+    """这个用户订阅了这个来源吗？（`sender_id=None` = 这个群里任何发送者）
+
+    给**用户令牌写共享层**的时候当门槛用：共享层（raw_message / group_state）是没有
+    归属的，一个用户往里面写就等于写进了所有人看到的那张表。所以要求他先证明
+    "这个来源是我自己订阅的" —— 这既是权限检查，也正好是产品规则本身
+    （订阅定义"抽什么"）。
+
+    与 `find_subscribers` 的区别：那个是跨用户的投递名单（服务令牌用），
+    这个是**带 user_id 的、单用户的**查询，所以它走正常的受护栏保护的路径。
+    """
+    clauses = ["user_id=?", "group_id=?", "enabled=1"]
+    params: list[Any] = [str(user_id), str(group_id)]
+    if sender_id is not None:
+        clauses.append("sender_id=?")
+        params.append(str(sender_id))
+    row = await fetch_one(
+        f"SELECT 1 AS ok FROM subscription WHERE {' AND '.join(clauses)} LIMIT 1",
+        tuple(params),
+    )
+    return row is not None
+
+
 async def find_subscribers(group_id: str, sender_id: str | None = None) -> list[str]:
     """**投递名单**：这条 (群, 发送者) 的消息，哪些用户要？
 

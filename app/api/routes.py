@@ -58,6 +58,7 @@ from ..db import (
     get_raw,
     get_stat,
     get_state,
+    has_subscription,
     insert_raw_message,
     list_corrections,
     list_digest_logs,
@@ -175,6 +176,47 @@ def _json_text(value: Any, fallback: Any) -> str:
 # --------------------------------------------------------------------------
 
 
+# --------------------------------------------------------------------------
+# 入库方（bot 或每个人的客户端）
+#
+# 多用户之前只有 bot 一个写入方，所以"写"就等于"服务令牌"。加了
+# xcollector-client 之后，**每个用户也可以在自己的机器上跑一个入库客户端**，
+# 用他自己的 UserToken 上报他读到的聊天记录。于是权限模型改成：
+#
+#   服务令牌（bot）    —— 代表整套部署，写什么都不用再证明什么
+#   用户令牌（客户端）  ——
+#       写**按用户的那一层**（通知 / 统计 / 缺口 / 自己的键值）：
+#           归属被强制成他自己（resolve_owner），碰不到别人，所以直接允许。
+#       写**共享层**（raw_message / group_state）：
+#           必须证明「这个来源是我自己订阅的」。共享层没有归属，一个人往里写
+#           就等于写进所有人看到的那张表 —— 要求先有订阅，既是权限检查，
+#           也正好就是产品规则本身（订阅定义"抽什么"）。
+#
+# 共享层的**读**保持服务令牌专属：那里面有所有人订阅的所有群的消息，
+# 让任何一个用户读到就是跨群泄露。写和读在这里是不对称的，是有意的。
+# --------------------------------------------------------------------------
+
+
+async def _require_subscribed(
+    identity: Identity, group_id: str, sender_id: str | None
+) -> None:
+    """用户令牌写共享层之前的门槛。服务令牌直接放行。"""
+    if identity.is_service:
+        return
+    owner = identity.user_id or ""
+    if await has_subscription(owner, group_id, sender_id):
+        return
+    raise HTTPException(
+        status_code=403,
+        detail=(
+            f"你还没有订阅这个来源（群 {group_id}"
+            + (f" · 发送者 {sender_id}" if sender_id else "")
+            + "），所以不能往共享的原始层写它的消息。"
+            "请先在网页上（或发 /订阅）把这个来源订上 —— 订阅决定了抽什么。"
+        ),
+    )
+
+
 class MessageBody(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
@@ -189,9 +231,17 @@ class MessageBody(BaseModel):
     raw: Any = None
 
 
-@router.post("/messages", dependencies=[WriteDep])
-async def create_message(body: MessageBody):
-    """创建原始消息（幂等：`(group_id, message_id)` 唯一）。"""
+@router.post("/messages")
+async def create_message(
+    body: MessageBody,
+    identity: Annotated[Identity, Depends(require_token)],
+):
+    """创建原始消息（幂等：`(group_id, message_id)` 唯一）。
+
+    服务令牌（bot）与用户令牌（客户端）都能调，但用户令牌要先证明这个来源是他
+    订阅的 —— 见上面那段说明。
+    """
+    await _require_subscribed(identity, body.group_id, body.sender_id or None)
     raw_id, is_new = await insert_raw_message(
         message_id=body.message_id,
         group_id=body.group_id,
@@ -213,7 +263,7 @@ async def create_message(body: MessageBody):
     return {"id": raw_id, "is_new": is_new}
 
 
-@router.get("/messages")
+@router.get("/messages", dependencies=[WriteDep])
 async def get_messages(
     state: list[str] | None = Query(default=None, description="可重复或逗号分隔"),
     group_id: str | None = Query(default=None),
@@ -221,6 +271,7 @@ async def get_messages(
     limit: int = Query(default=100, ge=1, le=1000),
     count_only: str | None = Query(default=None),
 ):
+    """**服务令牌专属**：共享层里是所有人订阅的所有群的消息，用户读它就是跨群泄露。"""
     states = _multi(state)
     if _flag(count_only):
         return {"count": await count_messages(states=states, group_id=group_id, since=since)}
@@ -228,8 +279,9 @@ async def get_messages(
     return {"messages": raw_views(rows)}
 
 
-@router.get("/messages/{raw_id}")
+@router.get("/messages/{raw_id}", dependencies=[WriteDep])
 async def get_message(raw_id: str):
+    """**服务令牌专属**（同理：共享层的读一律不给用户令牌）。"""
     row = await get_raw(raw_id)
     if row is None:
         raise HTTPException(status_code=404, detail="原始消息不存在")
@@ -244,19 +296,32 @@ class MessagePatch(BaseModel):
     attachments: Any = None
 
 
-@router.patch("/messages/{raw_id}", dependencies=[WriteDep])
-async def patch_message(raw_id: str, body: MessagePatch):
+@router.patch("/messages/{raw_id}")
+async def patch_message(
+    raw_id: str,
+    body: MessagePatch,
+    identity: Annotated[Identity, Depends(require_token)],
+):
     """只允许改 `state` / `state_reason` / `attachments`。
 
-    `attachments` 是"事后补齐"（bot 先落库消息本体，再下载、上传、回填），
+    `attachments` 是"事后补齐"（先落库消息本体，再下载、上传、回填），
     不是修改本体。`content` / `raw` / `ts` / `message_id` / `group_id` /
     `sender_id` 一律忽略 —— 传了也不会写进去，响应里的最终值就是证据。
+
+    用户令牌要对**那条原文自己的来源**有订阅才能改：门槛按行里的
+    (group_id, sender_id) 判，而不是按请求体 —— 请求体里根本没有这些字段。
     """
     provided = body.model_dump(exclude_unset=True)
     ignored = sorted(k for k in provided if k not in RAW_PATCHABLE)
 
-    if await get_raw(raw_id) is None:
+    existing = await get_raw(raw_id)
+    if existing is None:
         raise HTTPException(status_code=404, detail="原始消息不存在")
+    await _require_subscribed(
+        identity,
+        str(existing.get("group_id") or ""),
+        str(existing.get("sender_id") or "") or None,
+    )
 
     fields: dict[str, Any] = {}
     if "state" in provided:
@@ -303,7 +368,7 @@ class NotificationBody(BaseModel):
     prompt_ver: str | None = None
 
 
-@router.post("/notifications", dependencies=[WriteDep])
+@router.post("/notifications")
 async def create_notification(
     body: NotificationBody,
     identity: Annotated[Identity, Depends(require_token)],
@@ -314,7 +379,12 @@ async def create_notification(
     **按用户扇出**：同一个 raw_message 被 N 个用户订阅，bot 就在这里写 N 次、
     每次带不同的 user_id。抽取只跑一次，这里只是把结果分发给各人。
 
-    `evidence` 为空直接 400 —— 这是后端替 bot 守住的硬约束：
+    用户令牌也能调（每个人的客户端写自己那份），此时归属被强制成他自己。
+
+    这里**不要求**"已订阅这个来源"：通知是"我已经收到的东西"，订阅是"我以后要收
+    什么"。退订之后不该连历史通知都更新不了，而且重跑抽取时那条通知本来就还在。
+
+    `evidence` 为空直接 400 —— 这是后端替入库方守住的硬约束：
     没有证据的条目不许入库（防的是模型幻觉出一条无据的任务）。
     """
     owner = resolve_owner(identity, user_id)
@@ -567,9 +637,18 @@ async def mark_read(
 # --------------------------------------------------------------------------
 
 
-@router.post("/attachments", dependencies=[WriteDep])
+@router.post("/attachments")
 async def upload_attachment(request: Request):
-    """`multipart/form-data`：`file` / `filename` / `source_url`。"""
+    """`multipart/form-data`：`file` / `filename` / `source_url`。
+
+    服务令牌与用户令牌都能调：每个人的客户端也要上传自己读到的证据图。
+    `attachment` 表没有归属（**字节只存一份**，访问权由签发时绑定 user_id 的
+    签名 URL 决定），所以这里没有"这是不是他的"可以检查。
+
+    ⚠️ 代价说清楚：拿到任何有效令牌的人都能反复上传，唯一的闸是
+    `MEDIA_MAX_BYTES`（单文件上限）。这套部署本来就是邀请制的小范围使用，
+    所以先接受这个代价；要收紧就得给每个用户加配额。
+    """
     try:
         return await handle_upload(request)
     except TooLarge as exc:
@@ -776,18 +855,26 @@ class GroupBody(BaseModel):
     group_name: str | None = None
 
 
-@router.post("/groups", dependencies=[WriteDep])
-async def upsert_group_route(body: GroupBody):
+@router.post("/groups")
+async def upsert_group_route(
+    body: GroupBody,
+    identity: Annotated[Identity, Depends(require_token)],
+):
     """upsert 群状态。
 
-    响应里带 `previous_last_msg_ts`（更新**前**的值）—— bot 用它做缺口检测，
+    响应里带 `previous_last_msg_ts`（更新**前**的值）—— 入库方用它做缺口检测，
     省掉"先读再写"那一次竞态。
+
+    用户令牌要证明自己订阅了这个群里**至少一个**发送者（`sender_id=None`
+    那一档）：群状态是共享的，往它写就是往所有人看到的那张表写。
     """
+    await _require_subscribed(identity, body.group_id, None)
     return await upsert_group(body.group_id, body.group_name, body.last_msg_ts)
 
 
-@router.get("/groups")
+@router.get("/groups", dependencies=[WriteDep])
 async def get_groups():
+    """**服务令牌专属**：群列表是全站的（所有用户订阅的所有群）。"""
     return {"groups": await list_groups()}
 
 
@@ -806,7 +893,7 @@ class GapAlertBody(BaseModel):
     reason: str | None = None
 
 
-@router.post("/gap-alerts", dependencies=[WriteDep])
+@router.post("/gap-alerts")
 async def create_gap_alert(
     body: GapAlertBody,
     identity: Annotated[Identity, Depends(require_token)],
@@ -833,7 +920,7 @@ async def get_gap_alerts(
     return {"alerts": [{**row, "acknowledged": bool(row.get("acknowledged"))} for row in rows]}
 
 
-@router.post("/gap-alerts/{alert_id}/ack", dependencies=[WriteDep])
+@router.post("/gap-alerts/{alert_id}/ack")
 async def ack_gap_alert_route(
     alert_id: str,
     identity: Annotated[Identity, Depends(require_token)],
@@ -857,7 +944,7 @@ class StatsBody(BaseModel):
     fields: dict[str, Any] = Field(default_factory=dict)
 
 
-@router.post("/stats", dependencies=[WriteDep])
+@router.post("/stats")
 async def create_stats(
     body: StatsBody,
     identity: Annotated[Identity, Depends(require_token)],
@@ -962,7 +1049,7 @@ class StateBody(BaseModel):
     ttl_seconds: int | None = None
 
 
-@router.put("/state/{namespace}/{key}", dependencies=[WriteDep])
+@router.put("/state/{namespace}/{key}")
 async def put_state_route(
     namespace: str,
     key: str,
@@ -1000,7 +1087,7 @@ async def get_state_route(
     }
 
 
-@router.delete("/state/{namespace}/{key}", dependencies=[WriteDep])
+@router.delete("/state/{namespace}/{key}")
 async def delete_state_route(
     namespace: str,
     key: str,

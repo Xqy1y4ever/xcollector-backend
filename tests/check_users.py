@@ -134,9 +134,11 @@ check("用户令牌 /api/me → 200", r.status_code, 200)
 check("登录后拿到的是自己", r.json()["user"]["qq"], QQ_NEW)
 check("scope 是 user", r.json()["scope"], "user")
 
-# 写接口一律服务令牌专属
-r = c.post(f"{API}/messages", json={"message_id": "x", "group_id": "g", "ts": 1}, headers=user_headers(token))
-check("用户令牌入库 → 403（不是 401）", r.status_code, 403)
+# 只有服务令牌能做的事。注意 `POST /api/messages` **不再**属于这一类：
+# 加了 xcollector-client 之后，用户令牌也能往共享层写入库 —— 但必须先证明
+# "这个来源是我订阅的"（见 tests/check_client_permissions.py）。
+r = c.get(f"{API}/users", headers=user_headers(token))
+check("用户令牌列全部用户 → 403（不是 401）", r.status_code, 403)
 check_true("403 说明了原因", "只允许服务端" in r.text, r.text[:140])
 
 r = c.post(f"{API}/invites", json={"note": "偷发的"}, headers=user_headers(token))
