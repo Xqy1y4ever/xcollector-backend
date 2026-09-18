@@ -20,19 +20,18 @@ bot / 客户端写入，给每个用户读取自己的那一份。
 
 ### Docker（推荐）
 
-镜像由 CI 构建推送到 GHCR，编排在 deploy 仓库里：
+镜像由 CI 构建推送到 GHCR，部署脚本在 deploy 仓库里：
 
 ```bash
-cd xcollector-deploy
-cp .env.example .env          # 至少改 API_TOKEN
-docker compose up -d backend
+cd xcollector-deploy/backend
+cp .env.example .env          # 至少填 API_TOKEN
+./start.sh                    # 建网络与数据卷 → 起容器 → 等健康检查
 ```
 
 镜像名：`ghcr.io/xqy1y4ever/xcollector-backend:latest`。
-数据落在命名卷 `xcollector_backend-data`（容器内 `/app/data`），**必须挂卷**，
-否则容器一删数据就没了。
+数据落在 Docker 卷 `xcollector_backend-data`（容器内 `/app/data`），**别删这个卷**。
 
-单独跑（不起 compose）：
+单独跑（不用那个脚本）：
 
 ```bash
 docker run -d --name xcollector-backend \
@@ -91,7 +90,7 @@ curl -H "Authorization: Bearer $API_TOKEN" http://127.0.0.1:8000/api/health
 库是单文件、无外部依赖，**停止写入后直接复制目录**即可完成备份：
 
 ```bash
-# 命名卷（compose）
+# Docker 卷（deploy 里的默认卷名）
 docker run --rm -v xcollector_backend-data:/data -v "$PWD":/backup alpine \
   tar czf /backup/xcollector-$(date +%F).tar.gz -C /data .
 ```
