@@ -1,8 +1,10 @@
 """SQLite 数据访问层。
 
 分层铁律（见 docs/design.md §3.1）：
-  - raw_message 是唯一不可再生的资产，**只追加**，永不修改内容
-    （只有 state* 三个状态列会更新，用于标记"这条处理到哪一步了"）
+  - 原文是唯一不可再生的资产，**只追加**，永不修改内容
+    （只有 state* 三个状态列会更新，用于标记"这条处理到哪一步了"）。
+    两张表：`raw_message` 是共享层（bot 写），`user_raw_message` 是按用户的
+    原始层（每个人的客户端写自己那份）—— 见 §「原始层」那一段
   - notification 是派生层，可整表重建
   - correction 是人工修正，**只追加**。展示时用 correction 覆盖 notification
     里对应字段，这样重跑永远不会覆盖人工修正。
@@ -126,6 +128,15 @@ PRAGMA busy_timeout=5000;
 PRAGMA foreign_keys=ON;
 
 -- ==================== 原始层：只追加 ====================
+--
+-- **两张表，两个写入方**（见 routes.py 顶部那段说明）：
+--   raw_message      —— 共享层，只有**服务令牌（bot）**写。里面是整套部署里
+--                       "谁订阅过的群"的消息并集，读它的人不止一个，所以它不能
+--                       被任何一个用户写（否则等于能往所有人看到的表里塞东西）。
+--   user_raw_message —— 按用户，**用户令牌（客户端）**写自己的那一份。每个人
+--                       一台机器的客户端读的是他自己的聊天记录库，跟别人无关，
+--                       也就不需要"必须订阅过"这道门槛。
+-- 两张表的列完全一样，notification.raw_message_id 指向其中之一（按通知的归属判断）。
 CREATE TABLE IF NOT EXISTS raw_message (
   id            TEXT PRIMARY KEY,          -- 内部 ID（对外就是 raw_message_id）
   message_id    TEXT NOT NULL,             -- 来源侧的消息 ID，由 bot 提供
@@ -147,6 +158,30 @@ CREATE TABLE IF NOT EXISTS raw_message (
 CREATE INDEX IF NOT EXISTS ix_raw_ts       ON raw_message(ts DESC);
 CREATE INDEX IF NOT EXISTS ix_raw_group_ts ON raw_message(group_id, ts DESC);
 CREATE INDEX IF NOT EXISTS ix_raw_state    ON raw_message(state, ts DESC);
+
+-- 按用户的原始层（客户端写的那一份）。列与 raw_message 一模一样，只是多了归属，
+-- 幂等键也跟着带上 user_id：两个人在同一个群里各跑一个客户端，各自存自己那份，
+-- 互不干扰（谁也用不着"订阅过"才能写自己读到的东西）。
+CREATE TABLE IF NOT EXISTS user_raw_message (
+  id            TEXT PRIMARY KEY,
+  user_id       TEXT NOT NULL,
+  message_id    TEXT NOT NULL,
+  group_id      TEXT NOT NULL,
+  group_name    TEXT,
+  sender_id     TEXT NOT NULL,
+  sender_name   TEXT,
+  ts            INTEGER NOT NULL,
+  content       TEXT NOT NULL DEFAULT '',
+  attachments   TEXT NOT NULL DEFAULT '[]',
+  raw           TEXT NOT NULL,
+  ingested_at   INTEGER NOT NULL,
+  state         TEXT NOT NULL DEFAULT 'pending',
+  state_reason  TEXT,
+  state_at      INTEGER,
+  UNIQUE(user_id, group_id, message_id)
+);
+CREATE INDEX IF NOT EXISTS ix_uraw_owner_ts ON user_raw_message(user_id, ts DESC);
+CREATE INDEX IF NOT EXISTS ix_uraw_state    ON user_raw_message(user_id, state, ts DESC);
 
 -- ==================== 派生层：可整表重建 ====================
 -- 多用户之后，通知是**按用户扇出**的：同一个 raw_message 被 N 个用户订阅，
@@ -457,6 +492,9 @@ def db() -> aiosqlite.Connection:
 # 不算"用户表"的：raw_message（所有人共享的并集）、attachment（字节只存一份，
 # 访问权由它所属的通知决定）、group_state（群级事实）、app_user 等注册相关表
 # （它们本来就是按 qq / id 定位的）。
+#
+# `user_raw_message` **算**用户表：那是客户端的原始层，一行属于一个人，
+# 漏一个 user_id 就是"看到别人聊天记录"，比串通知严重得多。
 # --------------------------------------------------------------------------
 
 USER_SCOPED_TABLES = frozenset(
@@ -469,6 +507,7 @@ USER_SCOPED_TABLES = frozenset(
         "digest_log",
         "bot_state",
         "subscription",
+        "user_raw_message",
     }
 )
 
@@ -574,6 +613,15 @@ def _message_filters(
     return where, params
 
 
+def _raw_scope(user_id: str | None) -> str:
+    """原始层写哪张表：`None` = 共享层（bot），否则按用户（客户端）。
+
+    归属**不由调用方指定**，而是从令牌推出来的（见 routes.py）：服务令牌只会是
+    `None`，用户令牌只会是他自己的 id。这样"往哪张表写"不可能是请求参数决定的。
+    """
+    return "raw_message" if user_id is None else "user_raw_message"
+
+
 async def insert_raw_message(
     *,
     message_id: str,
@@ -585,39 +633,60 @@ async def insert_raw_message(
     content: str,
     attachments: list[dict],
     raw: dict,
+    user_id: str | None = None,
 ) -> tuple[str, bool]:
     """写入原始消息。返回 (raw_id, 是否新插入)。
 
-    幂等键是 `(group_id, message_id)`：重复提交返回已有 id，不产生新行，
+    幂等键：共享层是 `(group_id, message_id)`，按用户那层再带上 `user_id`
+    （两个人各跑一个客户端时，各自存自己那份）。重复提交返回已有 id，不产生新行，
     也**不会覆盖**已有记录（原始层只追加）。
     """
     raw_id = new_id()
-    rowcount = await execute(
-        """
-        INSERT OR IGNORE INTO raw_message
-          (id, message_id, group_id, group_name, sender_id, sender_name, ts,
-           content, attachments, raw, ingested_at, state)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')
-        """,
-        (
-            raw_id,
-            str(message_id),
-            str(group_id),
-            group_name,
-            str(sender_id),
-            sender_name,
-            int(ts),
-            content,
-            json.dumps(attachments, ensure_ascii=False),
-            json.dumps(raw, ensure_ascii=False),
-            now_ms(),
-        ),
+    values = (
+        raw_id,
+        str(message_id),
+        str(group_id),
+        group_name,
+        str(sender_id),
+        sender_name,
+        int(ts),
+        content,
+        json.dumps(attachments, ensure_ascii=False),
+        json.dumps(raw, ensure_ascii=False),
+        now_ms(),
     )
-    if rowcount == 0:
-        existing = await fetch_one(
-            "SELECT id FROM raw_message WHERE group_id=? AND message_id=?",
-            (str(group_id), str(message_id)),
+    if user_id is None:
+        rowcount = await execute(
+            """
+            INSERT OR IGNORE INTO raw_message
+              (id, message_id, group_id, group_name, sender_id, sender_name, ts,
+               content, attachments, raw, ingested_at, state)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,'pending')
+            """,
+            values,
         )
+    else:
+        rowcount = await execute(
+            """
+            INSERT OR IGNORE INTO user_raw_message
+              (id, user_id, message_id, group_id, group_name, sender_id, sender_name, ts,
+               content, attachments, raw, ingested_at, state)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,'pending')
+            """,
+            (raw_id, str(user_id), *values[1:]),
+        )
+    if rowcount == 0:
+        if user_id is None:
+            existing = await fetch_one(
+                "SELECT id FROM raw_message WHERE group_id=? AND message_id=?",
+                (str(group_id), str(message_id)),
+            )
+        else:
+            existing = await fetch_one(
+                "SELECT id FROM user_raw_message"
+                " WHERE user_id=? AND group_id=? AND message_id=?",
+                (str(user_id), str(group_id), str(message_id)),
+            )
         return (existing["id"] if existing else raw_id), False
     return raw_id, True
 
@@ -628,26 +697,38 @@ async def insert_raw_message(
 RAW_PATCHABLE = ("state", "state_reason", "attachments")
 
 
-async def set_raw_state(raw_id: str, state: str, reason: str | None = None) -> bool:
+async def set_raw_state(
+    raw_id: str, state: str, reason: str | None = None, *, user_id: str | None = None
+) -> bool:
     """只更新三个 state 列 —— 内容列永不修改（只追加铁律）。"""
-    rowcount = await execute(
-        "UPDATE raw_message SET state=?, state_reason=?, state_at=? WHERE id=?",
-        (state, reason, now_ms(), raw_id),
-    )
-    return rowcount > 0
+    if user_id is None:
+        sql = "UPDATE raw_message SET state=?, state_reason=?, state_at=? WHERE id=?"
+        params: list[Any] = [state, reason, now_ms(), raw_id]
+    else:
+        sql = (
+            "UPDATE user_raw_message SET state=?, state_reason=?, state_at=?"
+            " WHERE id=? AND user_id=?"
+        )
+        params = [state, reason, now_ms(), raw_id, str(user_id)]
+    return await execute(sql, params) > 0
 
 
-async def patch_raw_message(raw_id: str, fields: dict[str, Any]) -> bool:
+async def patch_raw_message(
+    raw_id: str, fields: dict[str, Any], *, user_id: str | None = None
+) -> bool:
     """改 state / state_reason / attachments（列名白名单在 RAW_PATCHABLE）。
 
     attachments 是"事后补齐"：bot 先落库消息本体，再去下载/上传附件，
     最后回填这张列表 —— 不是修改本体，所以允许。
+
+    `user_id` 给了就只动**他自己**那一行（客户端改自己那份原文）；给不给都不影响
+    共享层——两条路查的是不同的表，所以"改到别人那条"在 SQL 层面就不可能发生。
     """
     unknown = [k for k in fields if k not in RAW_PATCHABLE]
     if unknown:
         raise ValueError(f"不可修改的字段：{unknown}")
     if not fields:
-        return await get_raw(raw_id) is not None
+        return await get_raw(raw_id, user_id=user_id) is not None
     sets = ", ".join(f"{k}=?" for k in fields)
     params: list[Any] = list(fields.values())
     if "state" in fields:
@@ -655,11 +736,36 @@ async def patch_raw_message(raw_id: str, fields: dict[str, Any]) -> bool:
         sets += ", state_at=?"
         params.append(now_ms())
     params.append(raw_id)
-    return await execute(f"UPDATE raw_message SET {sets} WHERE id=?", params) > 0
+    if user_id is None:
+        return await execute(f"UPDATE raw_message SET {sets} WHERE id=?", params) > 0
+    params.append(str(user_id))
+    return (
+        await execute(
+            f"UPDATE user_raw_message SET {sets} WHERE id=? AND user_id=?", params
+        )
+        > 0
+    )
 
 
-async def get_raw(raw_id: str) -> dict | None:
-    return await fetch_one("SELECT * FROM raw_message WHERE id=?", (raw_id,))
+async def get_raw(raw_id: str, *, user_id: str | None = None) -> dict | None:
+    """按 id 取原文。`user_id` 给了就只在那个人自己的那份里找。"""
+    if user_id is None:
+        return await fetch_one("SELECT * FROM raw_message WHERE id=?", (raw_id,))
+    return await fetch_one(
+        "SELECT * FROM user_raw_message WHERE id=? AND user_id=?",
+        (raw_id, str(user_id)),
+    )
+
+
+async def get_raw_for_owner(raw_id: str, user_id: str) -> dict | None:
+    """取**某条通知**指向的原文：先找他自己的那份（客户端写的），再找共享层
+    （bot 写的）。
+
+    这个顺序不是"随便试试"：通知的归属决定它该看到哪一份原文。客户端写的通知指向
+    他自己那张表里的行；bot 扇出来的通知指向共享层的行。两者都只对这条通知的
+    主人有效 —— 调用方必须先确认这条通知是他的（`get_notification_row(notif_id, owner)`）。
+    """
+    return await get_raw(raw_id, user_id=user_id) or await get_raw(raw_id)
 
 
 async def list_messages(
@@ -1376,10 +1482,12 @@ async def has_subscription(
 ) -> bool:
     """这个用户订阅了这个来源吗？（`sender_id=None` = 这个群里任何发送者）
 
-    给**用户令牌写共享层**的时候当门槛用：共享层（raw_message / group_state）是没有
-    归属的，一个用户往里面写就等于写进了所有人看到的那张表。所以要求他先证明
-    "这个来源是我自己订阅的" —— 这既是权限检查，也正好是产品规则本身
-    （订阅定义"抽什么"）。
+    ⚠️ **现在没有任何调用方**：它以前是"用户令牌写共享层"的门槛，而共享层现在
+    只有服务令牌能写（客户端写自己那份 `user_raw_message`），订阅也就不再是
+    入库权限的一部分 —— 订阅只影响 bot 的实时入库与扇出。
+
+    留着它是因为它是"订阅关系"的一个正当查询工具（带 user_id、走护栏），
+    但**别把它接回写入路径**：那正是这次改掉的那个设计。
 
     与 `find_subscribers` 的区别：那个是跨用户的投递名单（服务令牌用），
     这个是**带 user_id 的、单用户的**查询，所以它走正常的受护栏保护的路径。

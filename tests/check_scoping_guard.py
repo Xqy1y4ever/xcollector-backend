@@ -88,6 +88,28 @@ for sql in [
 ]:
     check_true(f"无关表照样跑：{sql[:40]}…", allows(sql), sql[:60])
 
+print("\n=== 3b. 客户端的原始层（user_raw_message）是用户表 ===")
+# 这张表里是**一个人自己的聊天记录**，漏一个 user_id 就是"看到别人的聊天记录"。
+check_true(
+    "不带 user_id 读 → 拦下",
+    not allows("SELECT * FROM user_raw_message WHERE id=?"),
+)
+check_true(
+    "不带 user_id 写 → 拦下",
+    not allows("INSERT INTO user_raw_message (id, group_id, ts) VALUES (?,?,?)"),
+)
+check_true(
+    "按 id + user_id 读 → 放过",
+    allows("SELECT * FROM user_raw_message WHERE id=? AND user_id=?"),
+)
+check_true(
+    "按 (user_id, 群, 消息 id) 幂等查 → 放过",
+    allows(
+        "SELECT id FROM user_raw_message"
+        " WHERE user_id=? AND group_id=? AND message_id=?"
+    ),
+)
+
 print("\n=== 4. 表名识别不能被列名带偏 ===")
 # notification_id / correction_count 这类**列名**里含表名，不能当成碰了表
 check_true(
@@ -103,7 +125,7 @@ print("\n=== 5. 用户表清单本身 ===")
 # 写死清单是刻意的：新增一张用户表就必须来改这里，顺便被迫想一次
 # "这张表真的按用户隔离吗"。
 check(
-    "用户表清单就是契约里那 8 张",
+    "用户表清单就是这 9 张",
     sorted(USER_SCOPED_TABLES),
     sorted(
         [
@@ -115,6 +137,9 @@ check(
             "digest_log",
             "bot_state",
             "subscription",
+            # 客户端的原始层（原文）。以前的方案是"客户端也写共享的 raw_message，
+            # 但必须证明订阅过"；现在按用户分开存，这张表就是用户数据。
+            "user_raw_message",
         ]
     ),
 )

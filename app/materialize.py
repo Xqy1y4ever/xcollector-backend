@@ -105,13 +105,18 @@ WITH proj AS (
     n.source_ts                                   AS source_ts,
     -- raw_message_id 也透出来：入库客户端要靠它建"这条源消息我处理过"的集合。
     -- 游标丢了之后，这个集合能让客户端**跳过重新抽取**（也就是不重复花模型的
-    -- 钱）；而共享层的读是服务令牌专属的，用户令牌下没有别的办法拿到 raw id。
+    -- 钱）；而直接读原文的接口是服务令牌专属的，用户令牌下没有别的办法拿到 raw id。
     -- 它是这条通知自己的字段，不泄露任何别人的东西。
     n.raw_message_id                              AS raw_message_id,
     n.created_at                                  AS created_at,
     n.updated_at                                  AS updated_at,
-    r.attachments                                 AS raw_attachments
+    -- 原文可能在两层里的任何一层：客户端写的在**他自己**那张表里，bot 写的在
+    -- 共享层。两个 LEFT JOIN + COALESCE，比"先查一层再查另一层"少一次往返，
+    -- 也不会因为漏了一个分支而让附件静默消失（附件丢了界面上只是"没有图"）。
+    COALESCE(ur.attachments, r.attachments)        AS raw_attachments
   FROM notification n
+  LEFT JOIN user_raw_message ur
+         ON ur.id = n.raw_message_id AND ur.user_id = n.user_id
   LEFT JOIN raw_message r ON r.id = n.raw_message_id
 )
 """
@@ -258,10 +263,14 @@ VIEW_FIELDS = (
 
 
 def raw_view(row: dict | None, user_id: str = "") -> dict | None:
-    """raw_message 行的对外形状（含 content / attachments / raw / state）。
+    """原始层一行（`raw_message` 或 `user_raw_message`）的对外形状。
 
-    `user_id` 只用来签附件链接 —— raw_message 本身是**共享**的（它属于所有
-    订阅了这条消息的人），但附件链接必须只对请求者有效。
+    含 content / attachments / raw / state。`user_id` 只用来签附件链接 ——
+    原文可能是**共享层**的（bot 写的，属于所有订阅了这条消息的人），也可能是
+    **这个用户自己那份**（他的客户端写的），但附件链接必须只对请求者有效。
+
+    两层共用一个形状是刻意的：调用方只拿得到"自己那条通知指向的那一行"，
+    不需要、也不该知道它来自哪张表。
     """
     if row is None:
         return None

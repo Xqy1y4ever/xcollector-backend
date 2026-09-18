@@ -69,12 +69,13 @@
 多用户之前只有 bot 一个写入方，所以"能写"就等于"服务令牌"。现在
 [`xcollector-client`](https://github.com/Xqy1y4ever/xcollector-client) 让**每个用户
 可以在自己的机器上跑一个入库客户端**（读他自己 QQ 的聊天记录库，用他自己的
-UserToken 上报）。于是写权限按"写的是哪一层"分成三条：
+UserToken 上报）。于是原文有**两层**，写权限按"写的是哪一层"分：
 
 | 写什么 | 服务令牌 | 用户令牌 | 规则 |
 |---|---|---|---|
 | 按用户的那一层：通知 / 统计 / 缺口告警 / 自己的键值 | ✅ | ✅ | 归属被强制成他自己，碰不到别人，所以直接允许 |
-| 共享层：`raw_message` / `group_state` | ✅ | ⚠️ **要先订阅** | 必须已订阅这个 `(群, 发送者)`；写群状态要求订阅该群里的**任一**发送者 |
+| **按用户的原文**：`user_raw_message`（`POST/PATCH /api/messages`） | — | ✅ | 写进他自己那份。**不需要订阅任何来源** |
+| 共享层：`raw_message` / `group_state` | ✅ | ❌ 403 | 共享层是所有人订阅的群的并集，客户端不写它 |
 | `attachment` 字节 | ✅ | ✅ | 没有归属可查（字节只存一份），唯一的闸是 `MEDIA_MAX_BYTES` |
 | 运维动作：发邀请码/验证码、列用户、改机器字段、删通知、投递名单、digest-log | ✅ | ❌ 403 | 这些不是用户的自助操作 |
 
@@ -83,14 +84,26 @@ UserToken 上报）。于是写权限按"写的是哪一层"分成三条：
 | 读什么 | 服务令牌 | 用户令牌 |
 |---|---|---|
 | 共享层：`GET /api/messages`、`GET /api/messages/{id}`、`GET /api/groups` | ✅ | ❌ **403** |
+| 自己那条通知指向的原文（`GET /api/notifications/{id}` 里的 `raw`） | ✅ | ✅ 只对通知的主人有 |
 | 自己的通知 / 订阅 / 统计 / 缺口 / 键值 / `/api/sources` 目录 | ✅ | ✅ |
 
 共享层里是**所有人订阅的所有群**的消息，让任何一个用户读到就是跨群泄露，
 所以能写不等于能读。这条规则由 `tests/check_client_permissions.py` 守着。
 
-> 为什么用户令牌要"先订阅才能写共享层"：共享层没有归属，一个人往里写就等于
-> 写进所有人看到的那张表。要求先有订阅，既是权限检查，也正好就是产品规则本身
-> ——**订阅定义"抽什么"**。代价是客户端必须先让用户订阅，这一点是刻意的。
+> **订阅不是客户端的门槛**（2026-09 改掉了旧规则）。旧规则是"用户令牌也写共享层的
+> `raw_message`，但必须先证明订阅过这个来源"。它有两个问题：
+>
+> 1. **订阅表达不了客户端的输入**：订阅的单位是 `(群, 发送者)`、每人上限 200 条、
+>    且明确不支持整群订阅；而一个客户端手上是一整个聊天记录库（几十万组合）。
+>    要求它先订阅，等于要求它把自己的库先缩到 200 条 —— 那不是权限，是功能不可用。
+> 2. **它治不了本**：共表时客户端可以抢先写一行 `(群, message_id)`，而 bot 启动时的
+>    崩溃恢复（`GET /api/messages?state=pending`，服务令牌、全站）会把这行捡走、
+>    抽取、扇出给别人。
+>
+> 现在归属写在**表**上：客户端写 `user_raw_message`，bot 写 `raw_message`，
+> 越权在 SQL 层面就不可能发生（`user_raw_message` 也在 `USER_SCOPED_TABLES` 里，
+> 不带 `user_id` 的查询会被护栏拦下）。订阅回到了它本来的位置：**只影响 bot**
+> （决定 bot 抽什么、扇给谁）。
 >
 > 已知代价要说清楚：`attachment` 没有归属可查，所以拿到任何有效令牌的人都能
 > 反复上传，唯一的闸是单文件上限。这套部署本来就是邀请制的小范围使用，
@@ -103,14 +116,18 @@ UserToken 上报）。于是写权限按"写的是哪一层"分成三条：
 
 | 层 | 表 | 归属 | 说明 |
 |---|---|---|---|
-| **共享** | `raw_message`、`attachment`、`group_state` | 无 | 所有用户订阅的**并集**。同一条原始消息只存一份 |
-| **按用户** | `notification`、`correction`、`read_state`、`gap_alert`、`pipeline_stat`、`digest_log`、`bot_state`、`subscription` | `user_id` | 各自独立，互不可见 |
+| **共享** | `raw_message`、`attachment`、`group_state` | 无 | bot 写。`raw_message` 是所有用户订阅的**并集**，同一条原始消息只存一份 |
+| **按用户** | `user_raw_message`、`notification`、`correction`、`read_state`、`gap_alert`、`pipeline_stat`、`digest_log`、`bot_state`、`subscription` | `user_id` | 各自独立，互不可见 |
 
 由此推出两条必须记住的规则：
 
-1. **共享层的接口不带 `user_id`**：`POST/GET /api/messages`、`GET/PATCH /api/messages/{id}`、
+1. **共享层的接口不带 `user_id`**：`GET /api/messages`、`GET /api/messages/{id}`、
    `POST /api/attachments`、`POST/GET /api/groups`。
-2. **一条原始消息会扇出成 N 条通知**（每个订阅者一条），所以 `notification` 的
+2. **`POST /api/messages` 写哪一层由令牌决定**：服务令牌 → `raw_message`，
+   用户令牌 → `user_raw_message`（归属强制成他自己）。两边响应形状一样，
+   幂等键分别是 `(group_id, message_id)` 和 `(user_id, group_id, message_id)` ——
+   两个人在同一个群里各跑一个客户端，各自存自己那份，谁也顶不掉谁。
+3. **一条原始消息会扇出成 N 条通知**（每个订阅者一条），所以 `notification` 的
    幂等键是 **`(user_id, raw_message_id)`** 而不是 `raw_message_id`。
    同一个 raw 被两个人订，就有两行、两个 id、各自独立的读/完成/修正状态。
 
@@ -178,24 +195,40 @@ UserToken 上报）。于是写权限按"写的是哪一层"分成三条：
 
 ---
 
-## 1. 原始消息 `raw_message`
+## 1. 原始消息：共享层 `raw_message` + 按用户 `user_raw_message`
 
-**共享层**：所有用户订阅的并集，一模一样的一条只存一份。这些接口
-**都不带 `user_id`**（归属在这里没有意义）。
+**两层，两张表，列一模一样**：
 
-- **写**：服务令牌（bot）和用户令牌（每个人的入库客户端）都能写，但用户令牌
-  必须已订阅该 `(群, 发送者)` —— 见通用约定里的权限表。
-- **读**：**只有服务令牌**。共享层里是所有人订阅的所有群的消息，
+- `raw_message`（**共享**）：所有用户订阅的并集，一模一样的一条只存一份。
+  只有**服务令牌（bot）**能写、能读 —— 里面是所有人订阅的所有群的消息，
   让任何一个用户读到就是跨群泄露。
+- `user_raw_message`（**按用户**）：客户端的原始层。用户令牌写它、读它，
+  归属强制成他自己，**不需要订阅任何来源**。
 
-> 写前日志的落点：入库方收到消息后**第一件事**就是把它 POST 到这里，
-> 然后才去拿附件、抽取。`state=pending` 同时充当"还没处理完"的恢复队列。
+`notification.raw_message_id` 指向其中之一：客户端写的通知指向他自己那份，
+bot 扇出来的指向共享层。`GET /api/notifications/{id}` 里的 `raw` 两层都认
+（先找他自己的那份，再找共享层），但**只对这条通知的主人有**。
+
+> **为什么分两层**：以前是"用户令牌也写共享层，但必须先证明订阅过这个来源"。
+> 两个问题：订阅的单位是 `(群, 发送者)`、上限 200 条、不支持整群，表达不了
+> "一整个聊天记录库"；而且共表时客户端可以抢先写一行 `(群, message_id)`，
+> bot 的崩溃恢复（`GET /api/messages?state=pending`，全站）会把它捡走、扇给别人。
+> 现在越权在 SQL 层面就不可能发生（详见通用约定里的权限表）。
+
+> **旧数据不用搬**：老版本里（用订阅当门槛时）用户令牌写进共享层的那些行仍然在
+> `raw_message` 里 —— 它们的通知指向它，`GET /api/notifications/{id}` 的兜底
+> 照常取得到。新写入一律进 `user_raw_message`。
+
+> 写前日志的落点：入库方收到消息后**第一件事**就是把它 POST 到
+> `/api/messages`，然后才去拿附件、抽取。`state=pending` 同时充当"还没处理完"
+> 的恢复队列（**只对共享层**：bot 启动时会 `GET /api/messages?state=pending`；
+> 客户端那一层的恢复靠它自己的镜像库）。
 > DB 驱动的客户端（`xcollector-client`）里，源库本身就是更久的备份，
-> 所以它的游标丢了也只是重扫一遍，而不会丢消息。
+> 所以它的镜像丢了也只是重扫一遍，而不会丢消息。
 
 原始消息是**只追加**的：`content`/`raw` 一旦写入永不修改，只有 `state` 三个字段可变。
 
-### `POST /api/messages` — 创建（幂等）
+### `POST /api/messages` — 创建（幂等；写哪一层由令牌决定）
 
 ```json
 {
@@ -219,7 +252,10 @@ UserToken 上报）。于是写权限按"写的是哪一层"分成三条：
 {"id": "01J8XK2M9P", "is_new": true}
 ```
 
-同一 `(group_id, message_id)` 已存在时返回已有 `id` 且 `is_new: false`。
+幂等键：服务令牌是 `(group_id, message_id)`，用户令牌是
+`(user_id, group_id, message_id)` —— 已存在时返回已有 `id` 且 `is_new: false`。
+**用户令牌不需要订阅**：写的是他自己那份（`user_raw_message`），
+和共享层是两张表，谁也顶不掉谁。
 
 ### `GET /api/messages/{id}` → 行（含 `content`、`attachments`、`raw`、`state`）
 
@@ -244,6 +280,11 @@ Query：`state`（可重复或逗号分隔）、`group_id`、`since`（ts 毫秒
 
 `content` / `raw` / `ts` / `message_id` / `group_id` / `sender_id` 等**一律不可改** ——
 那是消息本体，改了就破坏了"原始层只追加"这条铁律。传了要忽略。
+
+**写哪一层由令牌决定**（和 POST 一样）：服务令牌改共享层的行，
+用户令牌改**他自己那份** —— SQL 里就带着 `user_id`，改到别人的行不可能发生；
+共享层里的行对用户令牌是 **404**（不区分"不存在"和"不是你的"，否则可以用它探测
+"这个 id 存在吗"）。
 
 响应返回更新后的行。
 
@@ -321,22 +362,25 @@ Query：
 | `status` | 人工修正优先；否则 `due_at` 已过 → `expired`，其余 `active` |
 | `manually_edited` | 是否有任何人工修正 |
 | `read` | 是否已读 |
-| `attachments` | 从对应的 `raw_message` 取 |
+| `attachments` | 从对应的原文行取 —— 可能是共享层 `raw_message`（bot 写的），也可能是这个用户自己的 `user_raw_message`（他的客户端写的） |
 | `extractor` / `model` / `prompt_ver` | 溯源 |
 | `raw_message_id` | 对应的原始消息 id（见下面的说明） |
 | `source_ts` / `created_at` / `updated_at` | 时间 |
 
 > **`raw_message_id` 是给入库客户端用的**：它靠这个字段建"这条源消息我处理过"的
-> 集合，于是在游标丢失后重扫时能**跳过重新抽取**（不重复花模型的钱）。
-> 共享层的读是服务令牌专属的，用户令牌下没有别的办法拿到 raw id。
+> 集合，于是在镜像丢失后重扫时能**跳过重新抽取**（不重复花模型的钱）。
+> 用户令牌下没有"直接读原文"的接口，所以这条路径是它拿到 raw id 的正当办法。
 > 它是这条通知自己的字段，不泄露任何别人的东西 —— 但**别指望**用它去反查共享层，
 > 那条路对用户令牌是封死的（见「谁能写什么」）。
 
 ### `GET /api/notifications/{id}`
 
 ```json
-{"notification": { ...读投影对象... }, "raw": { ...raw_message 行... }}
+{"notification": { ...读投影对象... }, "raw": { ...原文行... }}
 ```
+
+`raw` 两层都认：先找**这个用户自己那份**（客户端写的），再找共享层（bot 写的）。
+两条都只对这条通知的主人有 —— 别人的通知本来就 404。
 
 ### `PATCH /api/notifications/{id}` — 直接改机器字段
 
@@ -459,11 +503,16 @@ hex 字符。**签名同时覆盖 id 和 user_id**：
 
 ## 4. 群状态 `group_state`
 
-入库方（bot / 客户端）每收到一条消息就 upsert 一次。**缺口检测需要"上一条消息的
-时间"**，所以 upsert 会把更新前的值一并返回，省掉一次竞态的读。
+bot 每收到一条消息就 upsert 一次。**缺口检测需要"上一条消息的时间"**，
+所以 upsert 会把更新前的值一并返回，省掉一次竞态的读。
 
-- 写：服务令牌随时可写；**用户令牌要已订阅这个群里的任一发送者**（群状态是共享的）。
+- 写：**只有服务令牌**。群状态是共享的（一个群一行，全站一张表）。
 - 读（`GET /api/groups`）：**只有服务令牌** —— 群列表是全站的。
+
+> **客户端不写群状态**（用户令牌 → 403）。它的缺口检测用**自己的镜像库**里的
+> 时间线（`Mirror.group_seen_ts`）：两个客户端的同一条时间线写进同一张共享表会
+> 互相把 `previous_last_msg_ts` 顶掉，缺口告警就会静默地漏。
+> 缺口告警本身是**按用户**的（下面第 5 节），客户端照常写。
 
 ### `POST /api/groups` — upsert
 

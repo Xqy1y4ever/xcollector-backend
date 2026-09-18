@@ -56,9 +56,9 @@ from ..db import (
     fetch_one,
     get_notification_row,
     get_raw,
+    get_raw_for_owner,
     get_stat,
     get_state,
-    has_subscription,
     insert_raw_message,
     list_corrections,
     list_digest_logs,
@@ -181,40 +181,42 @@ def _json_text(value: Any, fallback: Any) -> str:
 #
 # 多用户之前只有 bot 一个写入方，所以"写"就等于"服务令牌"。加了
 # xcollector-client 之后，**每个用户也可以在自己的机器上跑一个入库客户端**，
-# 用他自己的 UserToken 上报他读到的聊天记录。于是权限模型改成：
+# 用他自己的 UserToken 上传他读到的聊天记录。于是权限模型是：
 #
-#   服务令牌（bot）    —— 代表整套部署，写什么都不用再证明什么
-#   用户令牌（客户端）  ——
-#       写**按用户的那一层**（通知 / 统计 / 缺口 / 自己的键值）：
-#           归属被强制成他自己（resolve_owner），碰不到别人，所以直接允许。
-#       写**共享层**（raw_message / group_state）：
-#           必须证明「这个来源是我自己订阅的」。共享层没有归属，一个人往里写
-#           就等于写进所有人看到的那张表 —— 要求先有订阅，既是权限检查，
-#           也正好就是产品规则本身（订阅定义"抽什么"）。
+#   服务令牌（bot）    —— 代表整套部署，写**共享层**（raw_message / group_state）。
+#                        共享层是所有用户订阅的群的并集，读它的人不止一个。
+#   用户令牌（客户端）  —— 写**按用户的那一层**（user_raw_message / 通知 / 统计 /
+#                        缺口 / 自己的键值 / 附件）：归属被强制成他自己，碰不到别人。
+#
+# 客户端**不再**需要"证明自己订阅过某个来源"（这一段以前是这么写的）：
+#
+#   · 订阅表达不了客户端的输入。订阅的单位是 (群, 发送者)，一个用户上限 200 条，
+#     而且明确不支持整群订阅（见 subscriptions.py）；可一个客户端手上是自己的
+#     全部聊天记录库，几十万个 (群, 发送者) 组合。要求它先订阅，等于要求它把
+#     自己的库先缩到 200 条 —— 那不是权限，是功能不可用。
+#   · 两道门槛里客户端那道也没意义：它读的就是**自己账号**的聊天记录，"这个来源
+#     是不是你能看到的"在那个语境下没有第三种答案。
+#   · 真正的护栏在这里：**客户端写不到共享层**（表都不是同一张）。以前两边共用
+#     raw_message，所以只能用"你必须订阅过"来近似"你只能写你能看到的东西"；
+#     现在归属写在表上，越权在 SQL 层面就不可能发生。顺带堵掉一个具体的洞：
+#     bot 的崩溃恢复是 `GET /api/messages?state=pending`（服务令牌、全站），
+#     共表时客户端抢先写进去的行会被 bot 捡走、抽取、扇出给别人。
 #
 # 共享层的**读**保持服务令牌专属：那里面有所有人订阅的所有群的消息，
 # 让任何一个用户读到就是跨群泄露。写和读在这里是不对称的，是有意的。
 # --------------------------------------------------------------------------
 
 
-async def _require_subscribed(
-    identity: Identity, group_id: str, sender_id: str | None
-) -> None:
-    """用户令牌写共享层之前的门槛。服务令牌直接放行。"""
+async def _raw_owner(identity: Identity) -> str | None:
+    """这次请求的原文该写进哪一层：`None` = 共享层（bot），否则是这个用户自己那份。
+
+    **只看令牌**，不看请求体：共享层是全站共用的，能不能往里写绝不能是调用方说了算。
+    """
     if identity.is_service:
-        return
-    owner = identity.user_id or ""
-    if await has_subscription(owner, group_id, sender_id):
-        return
-    raise HTTPException(
-        status_code=403,
-        detail=(
-            f"你还没有订阅这个来源（群 {group_id}"
-            + (f" · 发送者 {sender_id}" if sender_id else "")
-            + "），所以不能往共享的原始层写它的消息。"
-            "请先在网页上（或发 /订阅）把这个来源订上 —— 订阅决定了抽什么。"
-        ),
-    )
+        return None
+    if not identity.user_id:  # pragma: no cover - 构造上不可能
+        raise HTTPException(status_code=401, detail="令牌无效")
+    return identity.user_id
 
 
 class MessageBody(BaseModel):
@@ -236,12 +238,13 @@ async def create_message(
     body: MessageBody,
     identity: Annotated[Identity, Depends(require_token)],
 ):
-    """创建原始消息（幂等：`(group_id, message_id)` 唯一）。
+    """创建原始消息（幂等：`(user_id, group_id, message_id)` 唯一）。
 
-    服务令牌（bot）与用户令牌（客户端）都能调，但用户令牌要先证明这个来源是他
-    订阅的 —— 见上面那段说明。
+    服务令牌（bot）与用户令牌（客户端）都能调，**写进哪一层由令牌决定**：
+    bot 写共享层，客户端写自己那份（`user_raw_message`）。响应形状一样，
+    调用方不需要知道区别 —— 但客户端因此不需要先订阅任何来源。
     """
-    await _require_subscribed(identity, body.group_id, body.sender_id or None)
+    owner = await _raw_owner(identity)
     raw_id, is_new = await insert_raw_message(
         message_id=body.message_id,
         group_id=body.group_id,
@@ -252,6 +255,7 @@ async def create_message(
         content=body.content,
         attachments=body.attachments if body.attachments is not None else [],
         raw=body.raw if body.raw is not None else {},
+        user_id=owner,
     )
     logger.info(
         "原始消息落库：group=%s msg_id=%s is_new=%s 预览=%s",
@@ -308,20 +312,18 @@ async def patch_message(
     不是修改本体。`content` / `raw` / `ts` / `message_id` / `group_id` /
     `sender_id` 一律忽略 —— 传了也不会写进去，响应里的最终值就是证据。
 
-    用户令牌要对**那条原文自己的来源**有订阅才能改：门槛按行里的
-    (group_id, sender_id) 判，而不是按请求体 —— 请求体里根本没有这些字段。
+    用户令牌只能改**他自己那一层**里的行（客户端改自己那份原文）：SQL 里就带着
+    `user_id`，改到别人的行不可能发生。共享层里的行（bot 写的）用户令牌碰不到。
     """
     provided = body.model_dump(exclude_unset=True)
     ignored = sorted(k for k in provided if k not in RAW_PATCHABLE)
 
-    existing = await get_raw(raw_id)
+    owner = await _raw_owner(identity)
+    existing = await get_raw(raw_id, user_id=owner)
     if existing is None:
+        # 别人的行也是这条 —— 不区分"不存在"和"不是你的"，否则可以用它探测
+        # "这个 id 存在吗"。
         raise HTTPException(status_code=404, detail="原始消息不存在")
-    await _require_subscribed(
-        identity,
-        str(existing.get("group_id") or ""),
-        str(existing.get("sender_id") or "") or None,
-    )
 
     fields: dict[str, Any] = {}
     if "state" in provided:
@@ -332,10 +334,10 @@ async def patch_message(
     if "attachments" in provided:
         fields["attachments"] = _json_text(provided["attachments"], [])
 
-    await patch_raw_message(raw_id, fields)
+    await patch_raw_message(raw_id, fields, user_id=owner)
     if ignored:
         logger.info("PATCH /messages/%s 忽略了不可改字段：%s", raw_id, ignored)
-    return raw_view(await get_raw(raw_id))
+    return raw_view(await get_raw(raw_id, user_id=owner))
 
 
 # --------------------------------------------------------------------------
@@ -468,7 +470,9 @@ async def get_notification_detail(
         # 否则可以用它探测"这个 id 存在吗"。
         raise HTTPException(status_code=404, detail="通知不存在")
     row = await get_notification_row(notif_id, owner)
-    raw = await get_raw(row["raw_message_id"]) if row else None
+    # 原文可能在两层里的任何一层：bot 扇出来的通知指向共享层，客户端写的指向
+    # 他自己那份。两条都只对这条通知的主人有效（上面已经确认过归属）。
+    raw = await get_raw_for_owner(row["raw_message_id"], owner) if row else None
     return {"notification": view, "raw": raw_view(raw, owner)}
 
 
@@ -865,10 +869,21 @@ async def upsert_group_route(
     响应里带 `previous_last_msg_ts`（更新**前**的值）—— 入库方用它做缺口检测，
     省掉"先读再写"那一次竞态。
 
-    用户令牌要证明自己订阅了这个群里**至少一个**发送者（`sender_id=None`
-    那一档）：群状态是共享的，往它写就是往所有人看到的那张表写。
+    **只给服务令牌（bot）用**。群状态是共享的（一个群一行，全站一张表），
+    而客户端现在完全不写共享层：它的输入是自己账号的聊天记录库，缺口检测在
+    客户端本地用**自己的镜像**里的时间线做（见 xcollector-client 的 run.py），
+    不需要、也不该把"某个群的最后一条消息时间"写进全站共享的那张表 ——
+    两个客户端的同一条时间线会互相把 previous 顶掉，缺口告警就会静默地漏。
     """
-    await _require_subscribed(identity, body.group_id, None)
+    if not identity.is_service:
+        raise HTTPException(
+            status_code=403,
+            detail=(
+                "群状态是共享数据，只由 bot（服务令牌）写。"
+                "客户端不要写它：你自己的缺口检测用本地镜像里的消息时间线就够，"
+                "写进共享表反而会和别人的时间线互相顶掉。"
+            ),
+        )
     return await upsert_group(body.group_id, body.group_name, body.last_msg_ts)
 
 

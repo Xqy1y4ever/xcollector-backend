@@ -8,18 +8,26 @@
     $env:PERM_BASE='http://127.0.0.1:8005'; $env:PERM_SERVICE_TOKEN='service-token'
     .\\.venv\\Scripts\\python.exe -m tests.check_client_permissions
 
-## 为什么单独一个文件
+## 权限模型（2026-09 改过一版，这份文件跟着改了）
 
-加了 `xcollector-client` 之后，**用户令牌第一次能写共享层**（`raw_message` /
-`group_state`），而那是所有人看到的那张表。权限模型在这里从"两种令牌两种等级"
-变成了有边界的规则：
+加了 `xcollector-client` 之后，入库方有两个，原文也有**两层**：
 
-    写按用户的那一层（通知/统计/缺口/自己的键值）→ 归属强制成他自己，直接允许
-    写共享层（原文/群状态）                      → 必须先证明"这个来源我订阅了"
-    **读**共享层                                → 永远只有服务令牌
+    服务令牌（bot）    → 共享层：raw_message / group_state
+                         共享层是所有人订阅的群的并集，读它的人不止一个。
+    用户令牌（客户端）  → 按用户的那一层：user_raw_message / 通知 / 统计 / 缺口 /
+                         自己的键值 / 附件
+                         **读**共享层永远只有服务令牌（跨群泄露）
 
-最后一条是不对称的、也是有意的：共享层里是所有人订阅的所有群的消息，
-让任何一个用户读到就是跨群泄露。写能开、读不能开，这是这份文件最该守住的东西。
+关键变化：**客户端不再需要"证明自己订阅过某个来源"**。
+
+老规则是"用户令牌也写共享层的 raw_message，但必须先证明订阅过这个来源"。它有两个
+问题：一是订阅的单位是 (群, 发送者)、每人上限 200 条、不支持整群，而客户端手上是
+一整个聊天记录库（几十万组合）—— 那条规则等于让客户端的功能不可用；二是它治不了
+本、只是近似：共表时客户端可以抢先写一行 (群, 消息id)，bot 启动时的崩溃恢复
+（`GET /api/messages?state=pending`，服务令牌、全站）会把这行捡走、抽取、扇出给别人。
+
+现在归属写在**表**上：客户端写 `user_raw_message`，bot 写 `raw_message`。
+越权在 SQL 层面就不可能发生，订阅也回到它本来的位置 —— 只影响 bot。
 
 每一条"允许"都要配一条"拒绝"，否则权限放宽就等于没有边界。
 """
@@ -109,6 +117,16 @@ def notification_body(raw_id: str, *, group: str = GROUP, sender: str = SENDER) 
     }
 
 
+def raw_state_of(c: httpx.Client, token: str, nid: str):
+    """通过"自己那条通知"读回原文的状态。
+
+    用户令牌没有直接读原文的接口（那正是要守住的东西），而通知详情里带着原文 ——
+    这两条路都只对通知的主人有效。
+    """
+    body = c.get(f"{API}/notifications/{nid}", headers=hdr(token)).json()
+    return ((body or {}).get("raw") or {}).get("state")
+
+
 def main() -> int:
     c = httpx.Client(timeout=20)
     print(f"→ {BASE}  RUN={RUN}\n")
@@ -133,12 +151,60 @@ def main() -> int:
     check("没令牌 GET /api/messages → 401", c.get(f"{API}/messages").status_code, 401)
 
     # ------------------------------------------------------------------
-    print("\n--- 2. 还没订阅 → 不能往共享层写 ---")
+    print("\n--- 2. 客户端**一个订阅都没有**也能入库，但只写自己那一层 ---")
+    # 这一节是这次改动的核心：客户端读的是自己账号的聊天记录，
+    # "先订阅再上报"既表达不了它的输入，也表达不了它的权限。
     r = c.post(f"{API}/messages", json=message_body(f"perm-a-{RUN}"), headers=hdr(tok_a))
-    check("用户令牌没订阅就 POST /api/messages → 403", r.status_code, 403)
-    check_true("报错说清了是因为没订阅", "订阅" in r.text, r.text[:160])
+    check("没订阅任何来源 → POST /api/messages 仍然 200", r.status_code, 200)
+    raw_a = str((r.json() or {}).get("id") or "")
+    check_true("拿到 raw id", bool(raw_a), r.text[:160])
     check(
-        "用户令牌没订阅就 POST /api/groups → 403",
+        "同一条再 POST 一次是幂等的（幂等键带 user_id）",
+        c.post(f"{API}/messages", json=message_body(f"perm-a-{RUN}"), headers=hdr(tok_a))
+        .json()
+        .get("is_new"),
+        False,
+    )
+
+    # 但它**不在**共享层里 —— 这是"客户端写不到共享层"最直接的证据
+    check(
+        "服务令牌按 id 读这条 → 404（它在 A 自己那层，不在共享层）",
+        c.get(f"{API}/messages/{raw_a}", headers=H).status_code,
+        404,
+    )
+    shared_ids = {
+        m.get("id")
+        for m in c.get(f"{API}/messages", params={"limit": 1000}, headers=H).json()["messages"]
+    }
+    check_true("共享层的列表里也没有它", raw_a not in shared_ids, raw_a)
+
+    # 自己那一层：通过自己那条通知读得回来；别人读不到、也改不到
+    nid_a = str(
+        c.post(f"{API}/notifications", json=notification_body(raw_a), headers=hdr(tok_a)).json()["id"]
+    )
+    detail = c.get(f"{API}/notifications/{nid_a}", headers=hdr(tok_a)).json()
+    check("自己的通知详情里读得回原文", ((detail or {}).get("raw") or {}).get("id"), raw_a)
+    check(
+        "B 读 A 的通知 → 404",
+        c.get(f"{API}/notifications/{nid_a}", headers=hdr(tok_b)).status_code,
+        404,
+    )
+    check(
+        "A PATCH 自己的原文 → 200",
+        c.patch(f"{API}/messages/{raw_a}", json={"state": "extracted"}, headers=hdr(tok_a)).status_code,
+        200,
+    )
+    check(
+        "B PATCH A 的原文 → 404（SQL 里就带 user_id）",
+        c.patch(f"{API}/messages/{raw_a}", json={"state": "hacked"}, headers=hdr(tok_b)).status_code,
+        404,
+    )
+    check("而 A 的原文没被 B 改动", raw_state_of(c, tok_a, nid_a), "extracted")
+
+    # ------------------------------------------------------------------
+    print("\n--- 3. 共享层（原文 / 群状态）：只有服务令牌能写 ---")
+    check(
+        "用户令牌 POST /api/groups → 403",
         c.post(
             f"{API}/groups",
             json={"group_id": GROUP, "last_msg_ts": int(time.time() * 1000)},
@@ -146,83 +212,96 @@ def main() -> int:
         ).status_code,
         403,
     )
+    r = c.post(
+        f"{API}/groups",
+        json={"group_id": GROUP, "last_msg_ts": int(time.time() * 1000)},
+        headers=hdr(tok_a),
+    )
+    check_true("报错说清了替代做法（本地镜像）", "镜像" in r.text, r.text[:160])
+
+    r = c.post(f"{API}/messages", json=message_body(f"perm-svc-{RUN}"), headers=H)
+    check("服务令牌写共享层 → 200", r.status_code, 200)
+    raw_svc = str((r.json() or {}).get("id") or "")
+    check("服务令牌读得到它", c.get(f"{API}/messages/{raw_svc}", headers=H).status_code, 200)
+    check(
+        "用户令牌 PATCH 共享层那一行 → 404（不是他的层）",
+        c.patch(f"{API}/messages/{raw_svc}", json={"state": "hacked"}, headers=hdr(tok_a)).status_code,
+        404,
+    )
 
     # ------------------------------------------------------------------
-    print("\n--- 3. 订了之后：能写自己订阅的来源 ---")
+    print("\n--- 4. 两个人在同一个群里各存一份，互不干扰 ---")
+    # 同一条 (群, message_id)：两层都存得下，谁也不会把谁顶掉。
+    # 老模型下这是做不到的（共享层是 UNIQUE(group_id, message_id)）。
+    mid = f"perm-both-{RUN}"
+    a_id = str(c.post(f"{API}/messages", json=message_body(mid), headers=hdr(tok_a)).json()["id"])
+    b_id = str(c.post(f"{API}/messages", json=message_body(mid), headers=hdr(tok_b)).json()["id"])
+    check_true("两个 raw id 不一样（各存各的）", a_id != b_id, f"{a_id} vs {b_id}")
+    check(
+        "A 再写同一条 → 幂等回到自己那个",
+        c.post(f"{API}/messages", json=message_body(mid), headers=hdr(tok_a)).json().get("id"),
+        a_id,
+    )
+    nid_a2 = str(
+        c.post(f"{API}/notifications", json=notification_body(a_id), headers=hdr(tok_a)).json()["id"]
+    )
+    nid_b2 = str(
+        c.post(f"{API}/notifications", json=notification_body(b_id), headers=hdr(tok_b)).json()["id"]
+    )
+    check(
+        "A 改自己那条的 state → 200",
+        c.patch(f"{API}/messages/{a_id}", json={"state": "mine"}, headers=hdr(tok_a)).status_code,
+        200,
+    )
+    check("A 那条的 state 变了", raw_state_of(c, tok_a, nid_a2), "mine")
+    check("B 那条的 state 没跟着变（各存各的）", raw_state_of(c, tok_b, nid_b2), "pending")
+    check(
+        "B 改 A 那条 → 404",
+        c.patch(f"{API}/messages/{a_id}", json={"state": "hacked"}, headers=hdr(tok_b)).status_code,
+        404,
+    )
+
+    # ------------------------------------------------------------------
+    print("\n--- 5. 订阅还在，但只影响 bot ---")
+    # 订了、退订了、订的是别的来源 —— 客户端照写自己那份。这正是"订阅只影响 bot"。
+    for mid2, group, sender, label in (
+        (f"perm-sub-{RUN}", GROUP, SENDER, "A 订阅的来源"),
+        (f"perm-unsub-{RUN}", GROUP_OTHER, f"84{_SUF}", "A 没订阅的来源"),
+    ):
+        check(
+            f"没订阅也照写：{label} → 200",
+            c.post(
+                f"{API}/messages", json=message_body(mid2, group=group, sender=sender), headers=hdr(tok_a)
+            ).status_code,
+            200,
+        )
+
     r = c.post(
         f"{API}/subscriptions",
         json={"group_id": GROUP, "sender_id": SENDER, "group_name": "权限测试群"},
         headers=hdr(tok_a),
     )
-    check("A 用用户令牌订一个来源 → 200", r.status_code, 200)
-
-    r = c.post(f"{API}/messages", json=message_body(f"perm-a-{RUN}"), headers=hdr(tok_a))
-    check("订了之后 POST /api/messages → 200", r.status_code, 200)
-    raw_a = str((r.json() or {}).get("id") or "")
-    check_true("拿到 raw id", bool(raw_a), str(r.json()))
-    check("同一条再 POST 一次是幂等的", c.post(
-        f"{API}/messages", json=message_body(f"perm-a-{RUN}"), headers=hdr(tok_a)
-    ).json().get("is_new"), False)
-
-    # 群状态：订了这个群里**任何一个**发送者就够
-    r = c.post(
-        f"{API}/groups",
-        json={"group_id": GROUP, "group_name": "权限测试群", "last_msg_ts": int(time.time() * 1000)},
-        headers=hdr(tok_a),
-    )
-    check("订了之后 POST /api/groups → 200", r.status_code, 200)
-
-    # PATCH 原文：门槛按**那一行自己的来源**判，而不是请求体（请求体里没有这些字段）
-    r = c.patch(f"{API}/messages/{raw_a}", json={"state": "extracted"}, headers=hdr(tok_a))
-    check("订了之后 PATCH 自己来源的原文 → 200", r.status_code, 200)
-
-    # ------------------------------------------------------------------
-    print("\n--- 4. 但只限自己订阅的来源 ---")
-    r = c.post(
-        f"{API}/messages",
-        json=message_body(f"perm-other-{RUN}", group=GROUP_OTHER, sender=f"84{_SUF}"),
-        headers=hdr(tok_a),
-    )
-    check("写到没订阅的来源 → 403", r.status_code, 403)
-    r = c.post(
-        f"{API}/messages",
-        json=message_body(f"perm-othersender-{RUN}", group=GROUP, sender=f"85{_SUF}"),
-        headers=hdr(tok_a),
-    )
-    check("同一个群里**别的发送者**也 → 403（订阅的最小单位是人）", r.status_code, 403)
-    check(
-        "没订阅的群 POST /api/groups → 403",
-        c.post(
-            f"{API}/groups",
-            json={"group_id": GROUP_OTHER, "last_msg_ts": int(time.time() * 1000)},
-            headers=hdr(tok_a),
-        ).status_code,
-        403,
-    )
-
-    # B 没订阅任何东西，所以它连 A 订阅了的那个来源也写不了
-    r = c.post(f"{API}/messages", json=message_body(f"perm-b-{RUN}"), headers=hdr(tok_b))
-    check("B 没订阅，写 A 订的来源 → 403（订阅是按用户的）", r.status_code, 403)
-
-    # 退订之后连自己原来的来源也不能写了
+    check("A 订一个来源 → 200", r.status_code, 200)
     subs = c.get(f"{API}/subscriptions", headers=hdr(tok_a)).json()["subscriptions"]
     c.delete(f"{API}/subscriptions/{subs[0]['id']}", headers=hdr(tok_a))
-    r = c.post(
-        f"{API}/messages",
-        json=message_body(f"perm-after-unsub-{RUN}"),
-        headers=hdr(tok_a),
+    check(
+        "退订之后客户端照样写那个来源 → 200（订阅不管客户端）",
+        c.post(f"{API}/messages", json=message_body(f"perm-after-unsub-{RUN}"), headers=hdr(tok_a)).status_code,
+        200,
     )
-    check("退订之后就不能再写那个来源了 → 403", r.status_code, 403)
-
-    # 服务令牌不受影响：它是整套部署的入库方，不需要订阅
-    r = c.post(f"{API}/messages", json=message_body(f"perm-svc-{RUN}"), headers=H)
-    check("服务令牌写共享层不用订阅 → 200", r.status_code, 200)
+    # 而订阅仍然是 bot 投递名单的来源
+    check(
+        "服务令牌读投递名单 → 200",
+        c.get(
+            f"{API}/subscriptions/routing",
+            params={"group_id": GROUP, "sender_id": SENDER},
+            headers=H,
+        ).status_code,
+        200,
+    )
 
     # ------------------------------------------------------------------
-    print("\n--- 5. 按用户的那一层：用户令牌可以直接写，但只会写到自己名下 ---")
-    # 服务令牌造一条原文（用户令牌已经退订了，写不了）
-    raw_svc = str(c.post(f"{API}/messages", json=message_body(f"perm-svc2-{RUN}"), headers=H).json()["id"])
-
+    print("\n--- 6. 按用户的那一层：用户令牌可以直接写，但只会写到自己名下 ---")
     r = c.post(f"{API}/notifications", json=notification_body(raw_svc), headers=hdr(tok_a))
     check("用户令牌 POST /api/notifications → 200", r.status_code, 200)
     nid = str(r.json().get("id") or "")
@@ -237,6 +316,13 @@ def main() -> int:
     b_ids = {n.get("id") for n in c.get(f"{API}/notifications", headers=hdr(tok_b)).json()["notifications"]}
     check_true("A 的列表里有它", nid in a_ids)
     check_true("B 的列表里没有它", nid not in b_ids)
+    # 这条通知指向的是**共享层**的原文（服务令牌写的）：用户读自己通知里的原文
+    # 走的是"先找自己那层，再找共享层"，两条都只对他自己那条通知有效。
+    check(
+        "自己的通知里也能读回共享层那条原文",
+        ((c.get(f"{API}/notifications/{nid}", headers=hdr(tok_a)).json() or {}).get("raw") or {}).get("id"),
+        raw_svc,
+    )
 
     # 伪造 user_id 想写到别人名下：必须被无视。
     # 判据是"回到的还是同一条" —— 如果那个参数被当真了，它会新建成 B 的一条，
@@ -287,7 +373,7 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------
-    print("\n--- 6. 附件：能上传（没有归属可以检查，代价写在路由里）---")
+    print("\n--- 7. 附件：能上传（没有归属可以检查，代价写在路由里）---")
     png = bytes.fromhex(
         "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4"
         "890000000a49444154789c63000100000500010d0a2db40000000049454e44ae426082"
@@ -324,7 +410,7 @@ def main() -> int:
     )
 
     # ------------------------------------------------------------------
-    print("\n--- 7. 仍然只有服务令牌能做的事 ---")
+    print("\n--- 8. 仍然只有服务令牌能做的事 ---")
     check(
         "用户令牌签发验证码 → 403",
         c.post(f"{API}/verify/request", json={"qq": QQ_A}, headers=hdr(tok_a)).status_code,
