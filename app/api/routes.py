@@ -541,12 +541,22 @@ async def patch_notification_route(
     return await get_notification_view(owner, notif_id)
 
 
-@router.delete("/notifications/{notif_id}", dependencies=[WriteDep])
+@router.delete("/notifications/{notif_id}")
 async def delete_notification_route(
     notif_id: str,
     identity: Annotated[Identity, Depends(require_token)],
     user_id: str | None = Query(default=None),
 ):
+    """删掉一条通知。**自己的那条，用户自己就能删**（网页任务板上的「删除」按钮）。
+
+    权限说清楚：SQL 里带着 `user_id`，所以用户令牌只能删自己那份；别人的（或不存在
+    的）一律 404 —— 不区分"不存在"和"不是你的"，否则可以用它探测"这个 id 存在吗"。
+    服务令牌照旧能按 `?user_id=` 删任何人的（运维/重跑用）。
+
+    这是**真删**（只删通知行；`correction` / `read_state` 那些只追加层不动）。
+    想保留痕迹就别用这个，用 `POST /notifications/{id}/corrections` 把 status 改成
+    `archived` —— 网页上「归档」和「删除」是两个按钮，分别对应这两件事。
+    """
     owner = resolve_owner(identity, user_id)
     if not await delete_notification(notif_id, owner):
         raise HTTPException(status_code=404, detail="通知不存在")

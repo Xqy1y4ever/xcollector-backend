@@ -77,7 +77,8 @@ UserToken 上报）。于是原文有**两层**，写权限按"写的是哪一�
 | **按用户的原文**：`user_raw_message`（`POST/PATCH /api/messages`） | — | ✅ | 写进他自己那份。**不需要订阅任何来源** |
 | 共享层：`raw_message` / `group_state` | ✅ | ❌ 403 | 共享层是所有人订阅的群的并集，客户端不写它 |
 | `attachment` 字节 | ✅ | ✅ | 没有归属可查（字节只存一份），唯一的闸是 `MEDIA_MAX_BYTES` |
-| 运维动作：发邀请码/验证码、列用户、改机器字段、删通知、投递名单、digest-log | ✅ | ❌ 403 | 这些不是用户的自助操作 |
+| 运维动作：发邀请码/验证码、列用户、改机器字段、投递名单、digest-log | ✅ | ❌ 403 | 这些不是用户的自助操作 |
+| **删自己那条通知**（`DELETE /api/notifications/{id}`） | ✅ | ✅ 只限自己的 | 网页任务板上的「删除」；SQL 里带 `user_id`，别人的 → 404 |
 
 **读是不对称的**：
 
@@ -393,6 +394,11 @@ bot 重跑抽取时用。可改：`title` / `summary` / `location` / `due_at` / 
 响应返回更新后的读投影对象。
 
 ### `DELETE /api/notifications/{id}` → `{"deleted": true}`
+
+`?user_id=usr_xxx`（服务令牌必填）。用户令牌**可以**删自己那条（网页任务板上的「删除」
+按钮就是这么做的）：SQL 里带着 `user_id`，别人的或不存在的都回 404（不区分，免得被拿来
+探测 id）。这是**真删**（只删通知行，`correction` / `read_state` 那些只追加层不动）；
+想保留痕迹就用下面的 corrections 把 `status` 改成 `archived`。
 
 ### `POST /api/notifications/{id}/corrections` — 人工修正（只追加）
 

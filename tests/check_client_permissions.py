@@ -433,16 +433,40 @@ def main() -> int:
         ).status_code,
         403,
     )
-    # 改机器字段 / 删通知：那是"重跑抽取"和运维的动作，不是用户的自助操作
+    # 改机器字段：那是"重跑抽取"的动作，不是用户的自助操作
     check(
         "用户令牌 PATCH 通知的机器字段 → 403",
         c.patch(f"{API}/notifications/{nid}", json={"title": "改标题"}, headers=hdr(tok_a)).status_code,
         403,
     )
+    # 删自己的那条：**允许**（网页任务板上的「删除」按钮）。但只能删自己的。
+    # B 自己写一条原文（用户令牌写的是他自己那层），再建一条通知给 B。
+    r = c.post(f"{API}/messages", json=message_body("perm-b-1", sender=SENDER), headers=hdr(tok_b))
+    raw_b = str((r.json() or {}).get("id") or "")
+    check_true("B 能写自己的原文", bool(raw_b), r.text[:160])
+    nid_b = str(
+        c.post(f"{API}/notifications", json=notification_body(raw_b), headers=hdr(tok_b)).json().get("id") or ""
+    )
     check(
-        "用户令牌 DELETE 通知 → 403",
+        "用户令牌删**别人**的通知 → 404（不区分「不存在」和「不是你的」）",
+        c.delete(f"{API}/notifications/{nid_b}", headers=hdr(tok_a)).status_code,
+        404,
+    )
+    check_true("而且 B 那条还在", c.get(f"{API}/notifications/{nid_b}", headers=hdr(tok_b)).status_code == 200)
+    check(
+        "用户令牌删自己的通知 → 200",
         c.delete(f"{API}/notifications/{nid}", headers=hdr(tok_a)).status_code,
-        403,
+        200,
+    )
+    check(
+        "删掉之后就查不到了 → 404",
+        c.get(f"{API}/notifications/{nid}", headers=hdr(tok_a)).status_code,
+        404,
+    )
+    check(
+        "再删一次 → 404（幂等，不报 500）",
+        c.delete(f"{API}/notifications/{nid}", headers=hdr(tok_a)).status_code,
+        404,
     )
     check(
         "用户令牌写 digest-log → 403（那是 bot 的动作）",
